@@ -154,7 +154,7 @@ def _wait_for_global_spacing():
         _LAST_API_CALL = time.monotonic()
 
 
-def _generate(client, prompt, structured=False):
+def _generate(client, prompt, structured=False, schema=None):
     """
     Gemini request wrapper for the free tier.
 
@@ -169,7 +169,7 @@ def _generate(client, prompt, structured=False):
 
     if structured:
         kwargs["response_mime_type"] = "application/json"
-        kwargs["response_schema"] = RECOMMENDATION_SCHEMA
+        kwargs["response_schema"] = schema if schema else RECOMMENDATION_SCHEMA
 
     cache_key = _cache_key(MODEL, prompt, structured)
     cached = _get_cached(cache_key)
@@ -315,9 +315,11 @@ OTHER FACTORS:
 - business/sector quality only when supported by supplied application data.
 
 SCORING:
-- Investment Score: 0-100 for business/valuation/issue attractiveness.
-- Allotment Score: 0-100 for allotment attractiveness. Keep it separate
-  from investment quality.
+- You have been provided with deterministic, rule-based scores (`deterministic_listing_score`, `deterministic_investment_score`, `deterministic_allotment_score`) in the payload.
+- Do NOT output these exact scores independently. Instead, use them as your baseline.
+- You must output an "AI-adjusted" score (0-100) for Investment and Allotment that factors in qualitative risks/strengths not captured by the math.
+- In your `reason` field, you MUST explain your adjusted score relative to the deterministic score (e.g., "AI-adjusted Investment Score: 78. While the rule-based score was 82 based on financials, the heavy OFS component introduces risk...").
+- Keep Investment Score and Allotment Score conceptually separate.
 - Confidence reflects evidence completeness and reliability.
 - Apply means attractive enough to consider applying, not guaranteed
   returns or allotment.
@@ -336,6 +338,55 @@ IPO DATA:
     client = _get_client()
     try:
         response = _generate(client, prompt, structured=True)
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return json.loads(response.text)
+    finally:
+        client.close()
+
+RECOMMENDATION_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "company_name": {"type": "string"},
+                    "ai_adjustment": {"type": "integer"},
+                    "reason": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["High", "Medium", "Low"]},
+                },
+                "required": ["source_id", "company_name", "ai_adjustment", "reason", "confidence"]
+            }
+        }
+    },
+    "required": ["summary", "recommendations"]
+}
+
+def analyze_ipos_v2(ipos, objective="Balanced", risk_tolerance="Moderate", holding_horizon="Listing day"):
+    if not ipos:
+        raise ValueError("No IPO data was supplied for analysis.")
+
+    payload = json.dumps(ipos, ensure_ascii=False, default=str)
+
+    prompt = f"""
+You are an AI narrator for an Indian IPO intelligence application. You have been provided with deterministic scores. 
+Do not invent a new score. Your job is to explain WHY the deterministic score is what it is, and you may apply a maximum +/- 5 point 'AI Adjustment' based on qualitative anchor book data.
+
+User objective: {objective}
+Risk tolerance: {risk_tolerance}
+Holding horizon: {holding_horizon}
+
+IPO DATA:
+{payload}
+"""
+
+    client = _get_client()
+    try:
+        response = _generate(client, prompt, structured=True, schema=RECOMMENDATION_SCHEMA_V2)
         if not response.text:
             raise RuntimeError("Gemini returned an empty response.")
         return json.loads(response.text)
@@ -374,6 +425,7 @@ Rules:
 - Do not promise returns or allotment.
 - Be concise and practical.
 - If comparing IPOs, explain the key evidence from the supplied data.
+- If a user asks about external consensus or Trendlyne, state you cannot see it.
 
 CURRENT CONTEXT:
 {json.dumps(context, ensure_ascii=False, default=str)}

@@ -452,13 +452,33 @@ def collect_once(enrich=True):
     rows = client.get_current_ipos()
 
     if enrich:
+        db = Database()
+        try:
+            signals_map = {}
+            for row in rows:
+                sid = row.get("source_id")
+                sig = db.get_signal(sid) if sid else None
+                signals_map[sid] = sig
+        finally:
+            db.close()
+
         def status_priority(row):
             status = str(row.get("status") or "").lower()
             if status in {"live", "open", "pre-apply"}:
-                return 0
-            if status in {"tentative dates", "drhp approved"}:
-                return 1
-            return 2
+                base = 0
+            elif status in {"tentative dates", "drhp approved"}:
+                base = 1000
+            else:
+                base = 2000
+                
+            sid = row.get("source_id")
+            sig = signals_map.get(sid)
+            bonus = 0
+            if sig:
+                # Higher scores mean higher priority, so subtract them from base (lower is better rank)
+                bonus = (sig.get("investment_score") or 0) + (sig.get("allotment_score") or 0)
+            
+            return base - bonus
             
         rows.sort(key=status_priority)
         

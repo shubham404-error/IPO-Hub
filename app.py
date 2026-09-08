@@ -341,18 +341,32 @@ def ai_score_for_ipo(row):
 
     try:
         with st.spinner("AI is reviewing this IPO..."):
-            result = analyze_ipos(
+            from ai_advisor import analyze_ipos_v2
+            result = analyze_ipos_v2(
                 dataset,
                 objective="Balanced",
                 risk_tolerance="Moderate",
-                horizon="Listing day",
+                holding_horizon="Listing day",
             )
+            print("--- SHADOW MODE V2 LOG ---")
+            print(json.dumps(result, indent=2))
+            
         recommendations = result.get("recommendations", [])
         if recommendations:
-            st.session_state["ai_scores"][source_id] = recommendations[0]
+            rec = recommendations[0]
+            adj = rec.get("ai_adjustment", 0)
+            base_inv = dataset[0].get("deterministic_investment_score", 50)
+            base_allot = dataset[0].get("deterministic_allotment_score", 50)
+            
+            # Map back to legacy schema for UI compatibility during shadow mode
+            rec["investment_score"] = min(100, max(0, base_inv + adj))
+            rec["allotment_score"] = min(100, max(0, base_allot + adj))
+            rec["verdict"] = "Consider" # Placeholder since v2 dropped verdict
+            
+            st.session_state["ai_scores"][source_id] = rec
             db = Database()
             try:
-                db.save_ai_verdict(source_id, data_hash, recommendations[0])
+                db.save_ai_verdict(source_id, data_hash, rec)
             finally:
                 db.close()
     except Exception as exc:
@@ -375,6 +389,18 @@ def render_ai_score(score):
     reason = clean_text(score.get("reason"))
     if reason:
         st.caption(reason)
+
+def render_ai_verdict_v2(score, base_listing, base_inv, base_allot):
+    if not score:
+        return
+    adj = score.get("ai_adjustment", 0)
+    
+    st.markdown(f"**CapitalSense Score:** {base_inv + adj}")
+    st.caption(f"(Deterministic Base: {base_inv} | AI Qualitative Adjustment: {adj})")
+    
+    reason = clean_text(score.get("reason"))
+    if reason:
+        st.caption(f"*AI reasoning:* {reason}")
 
     sig1, sig2 = st.columns(2)
     with sig1:
@@ -516,9 +542,10 @@ def discovery_page(df):
                     inv_score = signals.get('investment_score', 0)
                     allot_score = signals.get('allotment_score', 0)
                     
-                    def score_color(score):
-                        if score >= 75: return "🟢"
-                        if score >= 50: return "🟡"
+                    def score_color(s):
+                        if s is None: return "⚪"
+                        if s >= 75: return "🟢"
+                        if s >= 50: return "🟡"
                         return "🔴"
                         
                     def get_summary(l, i, a):
@@ -540,6 +567,9 @@ def discovery_page(df):
                 if not score and st.button("Ask AI", key=f"ask_ai_{source_id}", use_container_width=True):
                     ai_score_for_ipo(row)
                     st.rerun()
+                elif score:
+                    # In shadow mode, we keep calling the old render_ai_score
+                    render_ai_score(score)
 
                 if st.button("View IPO", key=f"view_{source_id}", use_container_width=True):
                     st.session_state["selected_ipo"] = source_id
@@ -862,6 +892,26 @@ def ipo_detail_page(df):
         confidence = signals.get("signal_confidence", "Unknown")
         st.markdown(f"**Signal confidence:** {confidence}")
         st.markdown("---")
+        
+    # Phase 2: Trendlyne Widget Quarantine Testing
+    if st.query_params.get("widgets") == "true":
+        with st.expander("Trendlyne Consensus", expanded=False):
+            st.caption("Note: This external consensus is provided for reference only. CapitalSense AI does not have access to this Trendlyne widget and does not factor it into its analysis.")
+            
+            # Placeholder widget embed string based on Trendlyne's standard widget frame
+            import streamlit.components.v1 as components
+            company_name_safe = str(row.get("company_name", "")).lower().replace(" ", "-")
+            embed_string = f'''
+            <iframe 
+                src="https://trendlyne.com/web-widget/ipo/{company_name_safe}/" 
+                width="100%" 
+                height="100%" 
+                frameborder="0" 
+                style="border:0;" 
+                allowfullscreen>
+            </iframe>
+            '''
+            components.html(embed_string, height=500, scrolling=True)
 
     m1, m2 = st.columns(2)
     m1.metric("Price band", price_band(row))

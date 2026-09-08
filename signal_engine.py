@@ -178,13 +178,10 @@ def get_stage_multiplier(row):
     if days_elapsed <= 0:
         return 5.0 # Pre-open or Day 1 early
         
-    progress = days_elapsed / total_days
+    progress = max(0.0, min(1.0, days_elapsed / total_days))
     
-    if progress <= 0.35:
-        return 5.0
-    elif progress <= 0.70:
-        return 2.0
-    return 1.0
+    # Continuous decay from 5.0 (start) to 1.0 (end)
+    return 1.0 + 4.0 * (1.0 - progress)
 
 def calculate_listing_score(row, metrics, momentum, anchor_score, valuation_score):
     score = 0.0
