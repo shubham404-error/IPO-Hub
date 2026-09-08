@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS ipo_signals (
     allotment_shni INTEGER,
     allotment_bhni INTEGER,
     signal_confidence TEXT,
+    qvt_scorecard TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -192,6 +193,13 @@ class Database:
                 self.conn.execute(
                     f"ALTER TABLE ipos ADD COLUMN {name} {sql_type}"
                 )
+        
+        # Migrate ipo_signals table for qvt_scorecard
+        existing_signals = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(ipo_signals)")
+        }
+        if "qvt_scorecard" not in existing_signals:
+            self.conn.execute("ALTER TABLE ipo_signals ADD COLUMN qvt_scorecard TEXT")
 
     def upsert_ipos(self, rows):
         query = """
@@ -380,8 +388,8 @@ class Database:
                 gmp_momentum_24h, anchor_quality_score, valuation_score,
                 financial_quality_score, listing_score, investment_score,
                 allotment_score, allotment_retail, allotment_shni, allotment_bhni,
-                signal_confidence, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                signal_confidence, qvt_scorecard, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(source_id) DO UPDATE SET
                 signal_version=excluded.signal_version,
                 subscription_velocity_total=excluded.subscription_velocity_total,
@@ -403,6 +411,7 @@ class Database:
                 allotment_shni=excluded.allotment_shni,
                 allotment_bhni=excluded.allotment_bhni,
                 signal_confidence=excluded.signal_confidence,
+                qvt_scorecard=excluded.qvt_scorecard,
                 updated_at=excluded.updated_at
         """, (
             source_id, data.get("signal_version", "v1.1"),
@@ -413,7 +422,7 @@ class Database:
             data.get("gmp_momentum_24h"), data.get("anchor_quality_score"), data.get("valuation_score"),
             data.get("financial_quality_score"), data.get("listing_score"), data.get("investment_score"),
             data.get("allotment_score"), data.get("allotment_retail"), data.get("allotment_shni"),
-            data.get("allotment_bhni"), data.get("signal_confidence")
+            data.get("allotment_bhni"), data.get("signal_confidence"), data.get("qvt_scorecard")
         ))
         self.conn.commit()
 

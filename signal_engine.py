@@ -1,4 +1,5 @@
 import math
+import json
 import pandas as pd
 from datetime import datetime, timezone
 
@@ -288,6 +289,24 @@ def compute_signals(row, sub_history, gmp_history):
     
     confidence = calculate_confidence(row, sub_history, gmp_history)
     
+    # QVT Alignment
+    # Quality: Maps to financial_quality_score (0-10)
+    # Valuation: Maps to valuation_score (0-10)
+    # Trend: Maps to Subscription Velocity and GMP trajectory (0-10 scale)
+    v_score = min(5.0, metrics["v_total"]) # Cap at 5 for score contribution
+    m_val = momentum if momentum is not None else 0
+    m_score = min(5.0, max(0.0, m_val / 2.0)) # 10% momentum = 5 points
+    if momentum is None:
+        trend_score = int(min(10, v_score * 2))
+    else:
+        trend_score = int(min(10, v_score + m_score))
+        
+    qvt_scorecard = {
+        "Quality": fin_score,
+        "Valuation": val_score,
+        "Trend": trend_score
+    }
+    
     return {
         "signal_version": "v1.1",
         "subscription_velocity_total": metrics["v_total"],
@@ -308,5 +327,6 @@ def compute_signals(row, sub_history, gmp_history):
         "allotment_retail": allot["allotment_retail"],
         "allotment_shni": allot["allotment_shni"],
         "allotment_bhni": allot["allotment_bhni"],
-        "signal_confidence": confidence
+        "signal_confidence": confidence,
+        "qvt_scorecard": json.dumps(qvt_scorecard)
     }

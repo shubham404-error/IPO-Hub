@@ -26,8 +26,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-html, body, [class*="css"] {
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+@import url('https://api.fontshare.com/v2/css?f[]=clash-display@400,500,600,700&display=swap');
+html, body, [class*="css"]  {
+    font-family: 'Inter', sans-serif !important;
+}
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'Clash Display', sans-serif !important;
 }
 .stApp { background: #0b0d10; }
 .block-container {
@@ -42,7 +47,7 @@ h1 {
 h2 { font-size: clamp(1.25rem, 4vw, 1.7rem) !important; }
 h3 { font-size: clamp(1.05rem, 3.5vw, 1.3rem) !important; }
 button, input, textarea, select {
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
+    font-family: 'Inter', sans-serif !important;
 }
 
 /* Navigation lives in Streamlit's sidebar. The main content stays clean on mobile. */
@@ -309,6 +314,7 @@ def build_ai_dataset(frame):
                 rec["deterministic_allotment_score"] = sig.get("allotment_score")
                 rec["subscription_velocity_total"] = sig.get("subscription_velocity_total")
                 rec["gmp_momentum_24h"] = sig.get("gmp_momentum_24h")
+                rec["qvt_scorecard"] = sig.get("qvt_scorecard")
     finally:
         db.close()
         
