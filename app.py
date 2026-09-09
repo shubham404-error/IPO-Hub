@@ -37,7 +37,7 @@ h1, h2, h3, h4, h5, h6 {
 .stApp { background: #0b0d10; }
 .block-container {
     max-width: 1100px;
-    padding: 0.75rem clamp(0.7rem, 2.5vw, 1.5rem) 3rem;
+    padding: 4rem clamp(0.7rem, 2.5vw, 1.5rem) 3rem;
 }
 h1 {
     font-size: clamp(1.55rem, 5vw, 2.25rem) !important;
@@ -442,7 +442,8 @@ def discovery_page(df):
     with c2:
         status_filter = st.selectbox("Status", ["All", "Live", "Upcoming", "Closed"])
     with c3:
-        sort = st.selectbox("Sort", ["Close date", "Subscription", "GMP %"])
+        # Changed options to explicitly match Date, GMP, Issue Size per request
+        sort = st.selectbox("Sort", ["Date", "GMP", "Issue Size"])
     with c4:
         search = st.text_input("Search IPO", placeholder="Company name...")
 
@@ -454,11 +455,13 @@ def discovery_page(df):
     if search:
         view = view[view["company_name"].fillna("").str.contains(search, case=False, na=False)]
 
-    if sort == "Subscription":
-        view = view.sort_values("subscription", ascending=False, na_position="last")
-    elif sort == "GMP %":
+    if sort == "Issue Size":
+        view["sort_issue"] = pd.to_numeric(view["issue_size"], errors="coerce")
+        view = view.sort_values("sort_issue", ascending=False, na_position="last")
+    elif sort == "GMP":
         view = view.sort_values("gmp_pct", ascending=False, na_position="last")
     else:
+        # Date sorting
         view["sort_close"] = pd.to_datetime(view["close_date"], errors="coerce")
         view = view.sort_values(["sort_close", "company_name"], na_position="last")
 
