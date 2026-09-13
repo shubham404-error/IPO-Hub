@@ -1,5 +1,6 @@
 import re
 import time
+import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -224,6 +225,7 @@ class IPOJiClient:
                 "raw": {"detail_text": text[:16000], "anchor_section": anchor.get("raw")}
             }
         except Exception as exc:
+            logging.error(f"Error parsing detail for {url}: {exc}", exc_info=True)
             return {"raw": {"detail_error": str(exc)}}
 
     def parse_subscription(self, url):
@@ -283,6 +285,7 @@ class IPOJiClient:
             values["raw"] = {"subscription_text": text[:12000]}
             return values
         except Exception as exc:
+            logging.error(f"Error parsing subscription for {url}: {exc}", exc_info=True)
             return {"raw": {"subscription_error": str(exc)}}
 
     def parse_gmp(self, url, price_high):
@@ -315,6 +318,7 @@ class IPOJiClient:
                 "raw": {"gmp_text": text[:12000]},
             }
         except Exception as exc:
+            logging.error(f"Error parsing gmp for {url}: {exc}", exc_info=True)
             return {"raw": {"gmp_error": str(exc)}}
 
 

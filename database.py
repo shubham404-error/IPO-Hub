@@ -428,3 +428,20 @@ class Database:
 
     def close(self):
         self.conn.close()
+def get_df():
+    import pandas as pd
+    import sqlite3
+    from config import DB_PATH
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM ipos", conn)
+
+
+def get_selected_ipo(source_id):
+    db = Database()
+    try:
+        row = db.get_ipo(source_id)
+        sub_history = db.get_subscription_history(source_id)
+        gmp_history = db.get_gmp_history(source_id)
+        return dict(row) if row else None, [dict(x) for x in sub_history], [dict(x) for x in gmp_history]
+    finally:
+        db.close()

@@ -1,10 +1,13 @@
 import json
 import os
+import pandas as pd
+import streamlit as st
+from database import Database
 
 from google import genai
 from google.genai import types
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
 
 
 def get_gemini_api_key():
@@ -442,3 +445,92 @@ USER QUESTION:
         return response.text
     finally:
         client.close()
+
+def hash_dataset(dataset):
+    data_str = json.dumps(dataset, sort_keys=True, default=str)
+    import hashlib
+    return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
+
+def build_ai_dataset(frame):
+    cols = [
+        "source_id", "company_name", "segment", "display_status",
+        "open_date", "close_date", "price_low", "price_high", "lot_size",
+        "issue_size", "fresh_issue", "ofs_issue", "gmp", "gmp_pct",
+        "indicative_listing", "subscription", "qib", "nii", "snii",
+        "bnii", "retail", "applications", "listing_exchange",
+        "anchor_amount", "anchor_count", "anchor_price", "anchor_mf_pct",
+        "anchor_summary", "anchor_investors",
+        "pre_issue_holding", "post_issue_holding", "pe_pre", "pe_post",
+        "roe", "roce", "ronw", "pat_margin", "debt_equity", "price_book",
+        "market_cap", "strengths", "risks",
+    ]
+    available = [c for c in cols if c in frame.columns]
+    data = frame[available].copy()
+    
+    records = data.where(pd.notna(data), None).to_dict(orient="records")
+    
+    db = Database()
+    try:
+        for rec in records:
+            sig = db.get_signal(str(rec["source_id"]))
+            if sig:
+                rec["deterministic_listing_score"] = sig.get("listing_score")
+                rec["deterministic_investment_score"] = sig.get("investment_score")
+                rec["deterministic_allotment_score"] = sig.get("allotment_score")
+                rec["subscription_velocity_total"] = sig.get("subscription_velocity_total")
+                rec["gmp_momentum_24h"] = sig.get("gmp_momentum_24h")
+                rec["qvt_scorecard"] = sig.get("qvt_scorecard")
+    finally:
+        db.close()
+        
+    return records
+
+def ai_score_for_ipo(row):
+    if not get_gemini_api_key():
+        st.error("AI is not configured yet. Add GEMINI_API_KEY to Streamlit secrets.")
+        return
+        
+    source_id = str(row["source_id"])
+    dataset = build_ai_dataset(pd.DataFrame([row]))
+    data_hash = hash_dataset(dataset)
+    
+    db = Database()
+    try:
+        cached = db.get_ai_verdict(source_id)
+        if cached and cached["data_hash"] == data_hash:
+            st.session_state["ai_scores"][source_id] = json.loads(cached["recommendation_json"])
+            return
+    finally:
+        db.close()
+
+    try:
+        with st.spinner("AI is reviewing this IPO..."):
+            result = analyze_ipos_v2(
+                dataset,
+                objective="Balanced",
+                risk_tolerance="Moderate",
+                holding_horizon="Listing day",
+            )
+            print("--- SHADOW MODE V2 LOG ---")
+            print(json.dumps(result, indent=2))
+            
+        recommendations = result.get("recommendations", [])
+        if recommendations:
+            rec = recommendations[0]
+            adj = rec.get("ai_adjustment", 0)
+            base_inv = dataset[0].get("deterministic_investment_score", 50)
+            base_allot = dataset[0].get("deterministic_allotment_score", 50)
+            
+            # Map back to legacy schema for UI compatibility during shadow mode
+            rec["investment_score"] = min(100, max(0, base_inv + adj))
+            rec["allotment_score"] = min(100, max(0, base_allot + adj))
+            rec["verdict"] = "Consider" # Placeholder since v2 dropped verdict
+            
+            st.session_state["ai_scores"][source_id] = rec
+            db = Database()
+            try:
+                db.save_ai_verdict(source_id, data_hash, rec)
+            finally:
+                db.close()
+    except Exception as exc:
+        st.error(f"AI error: {exc}")

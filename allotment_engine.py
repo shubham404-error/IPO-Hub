@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from math import floor, ceil
 from typing import Optional
+import json
+import re
+from formatters import is_missing
 
 
 @dataclass(frozen=True)
@@ -127,3 +130,44 @@ def optimise(plans, capital, accounts):
 
     walk(0, accounts, capital, {})
     return best
+
+
+def _application_subscription(row, category):
+    """Read IPO Ji application-wise subscription from the stored raw text."""
+    raw = row.get("raw_json")
+    if not raw or is_missing(raw):
+        return None
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        text = str(payload.get("subscription_text", ""))
+    except Exception:
+        return None
+    if not text:
+        return None
+
+    aliases = {
+        "retail": r"Retail",
+        "snii": r"(?:SNIIs?|sHNI|sNII)(?:\s*\([^)]*\))?",
+        "bnii": r"(?:BNIIs?|bHNI|bNII)(?:\s*\([^)]*\))?",
+    }
+    label = aliases.get(category)
+    if not label:
+        return None
+
+    # IPO Ji exposes two share-wise/application-wise tables. The final match
+    # for each category is the application-wise figure.
+    pattern = rf"{label}\s+(?:[\d,]+|-)\s+(?:[\d,]+|-)\s+([\d.]+)"
+    matches = re.findall(pattern, text, re.I)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def _enrich_allotment_row(row):
+    row = dict(row)
+    for category in ("retail", "snii", "bnii"):
+        row[f"{category}_app_subscription"] = _application_subscription(row, category)
+    return row
