@@ -737,6 +737,32 @@ st.set_page_config(
     initial_sidebar_state="auto",
 )
 
+# --- Authentication ---
+try:
+    import streamlit_authenticator as stauth
+    if "credentials" in st.secrets:
+        authenticator = stauth.Authenticate(
+            dict(st.secrets["credentials"]),
+            st.secrets["cookie"]["name"],
+            st.secrets["cookie"]["key"],
+            st.secrets["cookie"]["expiry_days"],
+            dict(st.secrets["preauthorized"])
+        )
+        # Using the standard login widget
+        authenticator.login()
+        if st.session_state["authentication_status"] is False:
+            st.error("Username/password is incorrect")
+            st.stop()
+        elif st.session_state["authentication_status"] is None:
+            st.warning("Please enter your username and password")
+            st.stop()
+            
+        with st.sidebar:
+            authenticator.logout("Logout", "main")
+            st.markdown(f"Welcome *{st.session_state['name']}*")
+except ImportError:
+    st.warning("streamlit-authenticator not installed. Running without auth.")
+
 inject_styles()
 
 if "ai_scores" not in st.session_state:
@@ -780,7 +806,7 @@ if df.empty:
                 st.success(f"Updated {result['count']} IPOs.")
                 st.rerun()
             except Exception as exc:
-                st.error(f"Collector error: {exc}")
+                st.warning("Upstream API is currently unreachable. Displaying cached data.")
         st.caption("Data is refreshed from the configured IPO sources.")
     st.title("IPO Intelligence")
     st.info("No IPOs collected yet. Use Refresh data in the sidebar.")
@@ -853,7 +879,7 @@ with st.sidebar:
             st.success(f"Updated {result['count']} IPOs.")
             st.rerun()
         except Exception as exc:
-            st.error(f"Collector error: {exc}")
+            st.warning("Upstream API is currently unreachable. Displaying cached data.")
     try:
         latest = df["collected_at"].dropna().max()
         if pd.notna(latest):
@@ -1608,8 +1634,11 @@ MIGRATIONS = {
 class Database:
     def __init__(self, path=DB_PATH):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # Added timeout=20.0 to allow waiting for concurrent locks
+        self.conn = sqlite3.connect(path, timeout=20.0)
         self.conn.row_factory = sqlite3.Row
+        # Enable Write-Ahead Logging (WAL) for better concurrency
+        self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()
@@ -3144,6 +3173,2294 @@ def test_parse_detail_fixture():
 
 --- END FILE: tests\test_scraper.py ---
 
+--- BEGIN FILE: codebase.txt ---
+
+﻿ai_advisor.py
+import json
+import os
+import pandas as pd
+import streamlit as st
+from database import Database
+
+from google import genai
+from google.genai import types
+
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")
+
+
+def get_gemini_api_key():
+    key = os.getenv("GEMINI_API_KEY")
+    if key:
+        return key
+    try:
+        import streamlit as st
+        return st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        return None
+
+
+def _get_client():
+    api_key = get_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+    return genai.Client(api_key=api_key)
+
+
+# Free-tier protection: avoid accidental bursts and duplicate requests.
+import hashlib
+import threading
+import time
+
+_API_LOCK = threading.Lock()
+_LAST_API_CALL = 0.0
+_MIN_SECONDS_BETWEEN_CALLS = 2.5
+
+_RESPONSE_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_TTL_SECONDS = 90
+
+
+def _error_text(exc):
+    return str(exc or "")
+
+
+def _status_code(exc):
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        try:
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+
+    text = _error_text(exc)
+    for code in ("429", "500", "503", "504"):
+        if code in text:
+            return int(code)
+    return None
+
+
+def _is_daily_quota_error(exc):
+    text = _error_text(exc).lower()
+    return (
+        "quota" in text
+        or ("daily" in text and "limit" in text)
+        or ("resource exhausted" in text and "per day" in text)
+    )
+
+
+def _is_retryable_rate_error(exc):
+    code = _status_code(exc)
+    text = _error_text(exc).lower()
+
+    # Never hammer a daily quota that cannot recover during this session.
+    if _is_daily_quota_error(exc):
+        return False
+
+    if code in (500, 503, 504):
+        return True
+
+    if code == 429 or "rate_limit_exceeded" in text or "too many requests" in text:
+        return True
+
+    if "service unavailable" in text or "temporarily overloaded" in text:
+        return True
+
+    return False
+
+
+def _friendly_gemini_error(exc):
+    code = _status_code(exc)
+    text = _error_text(exc)
+    lowered = text.lower()
+
+    if _is_daily_quota_error(exc):
+        return (
+            "Gemini's free-tier daily quota has been reached. "
+            "The app will not keep retrying. Please try again after the quota resets."
+        )
+
+    if code == 429 or "rate_limit_exceeded" in lowered or "too many requests" in lowered:
+        return (
+            "Gemini is temporarily rate-limiting the app. "
+            "Please wait about 30–60 seconds and try again."
+        )
+
+    if code == 503 or "service unavailable" in lowered or "temporarily overloaded" in lowered:
+        return (
+            "Gemini is temporarily busy. "
+            "The app already retried safely. Please try again in a moment."
+        )
+
+    return f"Gemini request failed: {text}"
+
+
+def _cache_key(model, prompt, structured):
+    raw = f"{model}|{int(bool(structured))}|{prompt}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _get_cached(key):
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        item = _RESPONSE_CACHE.get(key)
+        if not item:
+            return None
+        timestamp, response_text = item
+        if now - timestamp > _CACHE_TTL_SECONDS:
+            _RESPONSE_CACHE.pop(key, None)
+            return None
+        return response_text
+
+
+def _put_cached(key, response_text):
+    with _CACHE_LOCK:
+        _RESPONSE_CACHE[key] = (time.monotonic(), response_text)
+        if len(_RESPONSE_CACHE) > 100:
+            oldest_key = min(_RESPONSE_CACHE, key=lambda k: _RESPONSE_CACHE[k][0])
+            _RESPONSE_CACHE.pop(oldest_key, None)
+
+
+def _wait_for_global_spacing():
+    """Serialize calls enough to avoid accidental free-tier bursts."""
+    global _LAST_API_CALL
+
+    with _API_LOCK:
+        now = time.monotonic()
+        wait = _MIN_SECONDS_BETWEEN_CALLS - (now - _LAST_API_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_API_CALL = time.monotonic()
+
+
+def _generate(client, prompt, structured=False, schema=None):
+    """
+    Gemini request wrapper for the free tier.
+
+    Protections:
+    - 90-second cache for identical prompts/context.
+    - 2.5-second minimum spacing between API calls in the process.
+    - Exponential backoff for transient 503/500/504 errors.
+    - Conservative retry for temporary 429 rate limits.
+    - No retry for daily quota exhaustion.
+    """
+    kwargs = {}
+
+    if structured:
+        kwargs["response_mime_type"] = "application/json"
+        kwargs["response_schema"] = schema if schema else RECOMMENDATION_SCHEMA
+
+    cache_key = _cache_key(MODEL, prompt, structured)
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        class CachedResponse:
+            def __init__(self, text):
+                self.text = text
+        return CachedResponse(cached)
+
+    # 2s, 5s, 10s exponential backoff.
+    delays = (2.0, 5.0, 10.0)
+    max_attempts = 3
+    last_exc = None
+
+    for attempt in range(max_attempts):
+        try:
+            _wait_for_global_spacing()
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(**kwargs),
+            )
+
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            _put_cached(cache_key, response.text)
+            return response
+
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_retryable_rate_error(exc) or attempt == max_attempts - 1:
+                raise RuntimeError(_friendly_gemini_error(exc)) from exc
+
+            time.sleep(delays[attempt])
+
+    raise RuntimeError(_friendly_gemini_error(last_exc)) from last_exc
+
+
+RECOMMENDATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "company_name": {"type": "string"},
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["Apply", "Consider", "Avoid", "Insufficient data"],
+                    },
+                    "investment_score": {"type": "integer"},
+                    "allotment_score": {"type": "integer"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["High", "Medium", "Low"],
+                    },
+                    "reason": {"type": "string"},
+                    "anchor_signal": {"type": "string"},
+                    "valuation_signal": {"type": "string"},
+                    "financial_signal": {"type": "string"},
+                    "demand_signal": {"type": "string"},
+                    "key_risks": {"type": "array", "items": {"type": "string"}},
+                    "research_notes": {"type": "string"},
+                },
+                "required": [
+                    "source_id",
+                    "company_name",
+                    "verdict",
+                    "investment_score",
+                    "allotment_score",
+                    "confidence",
+                    "reason",
+                    "anchor_signal",
+                    "valuation_signal",
+                    "financial_signal",
+                    "demand_signal",
+                    "key_risks",
+                    "research_notes",
+                ],
+            },
+        },
+    },
+    "required": ["summary", "recommendations"],
+}
+
+
+def analyze_ipos(
+    ipos,
+    objective="Balanced",
+    risk_tolerance="Moderate",
+    holding_horizon="Listing day",
+    horizon=None,
+):
+    if horizon is not None:
+        holding_horizon = horizon
+
+    if not ipos:
+        raise ValueError("No IPO data was supplied for analysis.")
+
+    payload = json.dumps(ipos, ensure_ascii=False, default=str)
+
+    prompt = f"""
+You are the decision engine for an Indian IPO intelligence application.
+
+User objective: {objective}
+Risk tolerance: {risk_tolerance}
+Holding horizon: {holding_horizon}
+
+IMPORTANT DATA RULE:
+Use ONLY the supplied application IPO data. Do not use web search,
+external browsing, outside facts, or assumed investor track records.
+If a fact is not present in the supplied data, say that it is unavailable.
+
+IMPORTANT SUBSCRIPTION TIMING:
+- Do NOT penalize an IPO simply because QIB subscription is low early in
+  the bidding period.
+- QIB and NII demand can be heavily back-loaded and may rise sharply on
+  the final day.
+- Treat subscription as a time-stamped snapshot, not final demand.
+
+ANCHOR INVESTOR ANALYSIS:
+- Use the supplied anchor amount, count, price, mutual-fund percentage,
+  summary and named investors.
+- Evaluate breadth, diversity and concentration from the supplied data.
+- Consider domestic mutual fund participation when supplied.
+- Do not treat a famous investor name as proof that an IPO is good.
+- Do not invent or infer an investor's historical performance.
+
+OTHER FACTORS:
+- valuation: P/E, P/B and market cap when available;
+- financial quality: ROE, ROCE, RoNW, PAT margin, debt/equity and
+  promoter holding when available;
+- fresh issue versus OFS;
+- GMP and GMP trend, clearly marked unofficial;
+- category subscription with timing;
+- issue size, price band and lot size;
+- supplied strengths and risks;
+- business/sector quality only when supported by supplied application data.
+
+SCORING:
+- You have been provided with deterministic, rule-based scores (`deterministic_listing_score`, `deterministic_investment_score`, `deterministic_allotment_score`) in the payload.
+- Do NOT output these exact scores independently. Instead, use them as your baseline.
+- You must output an "AI-adjusted" score (0-100) for Investment and Allotment that factors in qualitative risks/strengths not captured by the math.
+- In your `reason` field, you MUST explain your adjusted score relative to the deterministic score (e.g., "AI-adjusted Investment Score: 78. While the rule-based score was 82 based on financials, the heavy OFS component introduces risk...").
+- Keep Investment Score and Allotment Score conceptually separate.
+- Confidence reflects evidence completeness and reliability.
+- Apply means attractive enough to consider applying, not guaranteed
+  returns or allotment.
+
+RESEARCH NOTES:
+Because this is a free-tier, database-only AI system, research_notes must
+describe only what can be verified from the supplied application data.
+Do not claim that anything was checked online.
+
+Return one recommendation for every IPO supplied.
+
+IPO DATA:
+{payload}
+"""
+
+    client = _get_client()
+    try:
+        response = _generate(client, prompt, structured=True)
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return json.loads(response.text)
+    finally:
+        client.close()
+
+RECOMMENDATION_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string"},
+                    "company_name": {"type": "string"},
+                    "ai_adjustment": {"type": "integer"},
+                    "reason": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["High", "Medium", "Low"]},
+                },
+                "required": ["source_id", "company_name", "ai_adjustment", "reason", "confidence"]
+            }
+        }
+    },
+    "required": ["summary", "recommendations"]
+}
+
+def analyze_ipos_v2(ipos, objective="Balanced", risk_tolerance="Moderate", holding_horizon="Listing day"):
+    if not ipos:
+        raise ValueError("No IPO data was supplied for analysis.")
+
+    payload = json.dumps(ipos, ensure_ascii=False, default=str)
+
+    prompt = f"""
+You are an AI narrator for an Indian IPO intelligence application. You have been provided with deterministic scores. 
+Do not invent a new score. Your job is to explain WHY the deterministic score is what it is, and you may apply a maximum +/- 5 point 'AI Adjustment' based on qualitative anchor book data.
+
+User objective: {objective}
+Risk tolerance: {risk_tolerance}
+Holding horizon: {holding_horizon}
+
+IPO DATA:
+{payload}
+"""
+
+    client = _get_client()
+    try:
+        response = _generate(client, prompt, structured=True, schema=RECOMMENDATION_SCHEMA_V2)
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return json.loads(response.text)
+    finally:
+        client.close()
+
+
+def chat_with_advisor(
+    message,
+    analysis=None,
+    ipos=None,
+    objective="Balanced",
+    risk_tolerance="Moderate",
+    holding_horizon="Listing day",
+):
+    context = {
+        "objective": objective,
+        "risk_tolerance": risk_tolerance,
+        "holding_horizon": holding_horizon,
+        "analysis": analysis or {},
+        "ipos": ipos or [],
+    }
+
+    prompt = f"""
+You are the IPO Advisor inside an Indian IPO intelligence application.
+
+Answer the user's question using ONLY the supplied application data and
+previous analysis.
+
+Rules:
+- Do not use web search or external information.
+- Do not invent facts.
+- If the supplied data does not contain the answer, say it is not available.
+- Keep investment attractiveness and allotment probability separate.
+- GMP is unofficial and not guaranteed.
+- Do not promise returns or allotment.
+- Be concise and practical.
+- If comparing IPOs, explain the key evidence from the supplied data.
+- If a user asks about external consensus or Trendlyne, state you cannot see it.
+
+CURRENT CONTEXT:
+{json.dumps(context, ensure_ascii=False, default=str)}
+
+USER QUESTION:
+{message}
+"""
+
+    client = _get_client()
+    try:
+        response = _generate(client, prompt, structured=False)
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return response.text
+    finally:
+        client.close()
+
+def hash_dataset(dataset):
+    data_str = json.dumps(dataset, sort_keys=True, default=str)
+    import hashlib
+    return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
+
+def build_ai_dataset(frame):
+    cols = [
+        "source_id", "company_name", "segment", "display_status",
+        "open_date", "close_date", "price_low", "price_high", "lot_size",
+        "issue_size", "fresh_issue", "ofs_issue", "gmp", "gmp_pct",
+        "indicative_listing", "subscription", "qib", "nii", "snii",
+        "bnii", "retail", "applications", "listing_exchange",
+        "anchor_amount", "anchor_count", "anchor_price", "anchor_mf_pct",
+        "anchor_summary", "anchor_investors",
+        "pre_issue_holding", "post_issue_holding", "pe_pre", "pe_post",
+        "roe", "roce", "ronw", "pat_margin", "debt_equity", "price_book",
+        "market_cap", "strengths", "risks",
+    ]
+    available = [c for c in cols if c in frame.columns]
+    data = frame[available].copy()
+    
+    records = data.where(pd.notna(data), None).to_dict(orient="records")
+    
+    db = Database()
+    try:
+        for rec in records:
+            sig = db.get_signal(str(rec["source_id"]))
+            if sig:
+                rec["deterministic_listing_score"] = sig.get("listing_score")
+                rec["deterministic_investment_score"] = sig.get("investment_score")
+                rec["deterministic_allotment_score"] = sig.get("allotment_score")
+                rec["subscription_velocity_total"] = sig.get("subscription_velocity_total")
+                rec["gmp_momentum_24h"] = sig.get("gmp_momentum_24h")
+                rec["qvt_scorecard"] = sig.get("qvt_scorecard")
+    finally:
+        db.close()
+        
+    return records
+
+def ai_score_for_ipo(row):
+    if not get_gemini_api_key():
+        st.error("AI is not configured yet. Add GEMINI_API_KEY to Streamlit secrets.")
+        return
+        
+    source_id = str(row["source_id"])
+    dataset = build_ai_dataset(pd.DataFrame([row]))
+    data_hash = hash_dataset(dataset)
+    
+    db = Database()
+    try:
+        cached = db.get_ai_verdict(source_id)
+        if cached and cached["data_hash"] == data_hash:
+            st.session_state["ai_scores"][source_id] = json.loads(cached["recommendation_json"])
+            return
+    finally:
+        db.close()
+
+    try:
+        with st.spinner("AI is reviewing this IPO..."):
+            result = analyze_ipos_v2(
+                dataset,
+                objective="Balanced",
+                risk_tolerance="Moderate",
+                holding_horizon="Listing day",
+            )
+            print("--- SHADOW MODE V2 LOG ---")
+            print(json.dumps(result, indent=2))
+            
+        recommendations = result.get("recommendations", [])
+        if recommendations:
+            rec = recommendations[0]
+            adj = rec.get("ai_adjustment", 0)
+            base_inv = dataset[0].get("deterministic_investment_score", 50)
+            base_allot = dataset[0].get("deterministic_allotment_score", 50)
+            
+            # Map back to legacy schema for UI compatibility during shadow mode
+            rec["investment_score"] = min(100, max(0, base_inv + adj))
+            rec["allotment_score"] = min(100, max(0, base_allot + adj))
+            rec["verdict"] = "Consider" # Placeholder since v2 dropped verdict
+            
+            st.session_state["ai_scores"][source_id] = rec
+            db = Database()
+            try:
+                db.save_ai_verdict(source_id, data_hash, rec)
+            finally:
+                db.close()
+    except Exception as exc:
+        st.error(f"AI error: {exc}")
+
+allotment_engine.py
+from dataclasses import dataclass
+from math import floor, ceil
+from typing import Optional
+import json
+import re
+from formatters import is_missing
+
+
+@dataclass(frozen=True)
+class CategoryPlan:
+    key: str
+    label: str
+    min_amount: float
+    min_lots: int
+    probability: float
+    source: str
+
+
+def _num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def application_probability(app_subscription: Optional[float], share_subscription: Optional[float]):
+    """Estimate minimum-application allotment probability.
+
+    Application-wise subscription is preferred because retail/NII allotment
+    depends on the number of applicants, not simply the number of shares bid.
+    If unavailable, share-wise subscription is used as a clearly-labelled
+    fallback proxy.
+    """
+    app = _num(app_subscription)
+    shares = _num(share_subscription)
+    if app is not None and app > 0:
+        return min(1.0, 1.0 / app), "application subscription"
+    if shares is not None and shares > 0:
+        return min(1.0, 1.0 / shares), "share subscription proxy"
+    return None, "unavailable"
+
+
+def build_category_plans(row, lot_size: int, price: float):
+    lot_value = lot_size * price
+    plans = []
+
+    retail_p, retail_source = application_probability(
+        row.get("retail_app_subscription"), row.get("retail")
+    )
+    if retail_p is not None and lot_value <= 200000:
+        plans.append(CategoryPlan(
+            "retail", "Retail", lot_value, 1, retail_p, retail_source
+        ))
+
+    # Mainboard NII rules: sNII is above ₹2L and up to ₹10L;
+    # bNII is above ₹10L. We calculate the smallest valid bid in lots.
+    s_lots = floor(200000 / lot_value) + 1
+    s_amount = s_lots * lot_value
+    b_lots = floor(1000000 / lot_value) + 1
+    b_amount = b_lots * lot_value
+
+    s_p, s_source = application_probability(
+        row.get("snii_app_subscription"), row.get("snii")
+    )
+    b_p, b_source = application_probability(
+        row.get("bnii_app_subscription"), row.get("bnii")
+    )
+
+    if s_p is not None and s_amount <= 1000000:
+        plans.append(CategoryPlan("snii", "Small HNI", s_amount, s_lots, s_p, s_source))
+    if b_p is not None:
+        plans.append(CategoryPlan("bnii", "Big HNI", b_amount, b_lots, b_p, b_source))
+
+    return plans
+
+
+def optimise(plans, capital, accounts):
+    """Enumerate account allocations to maximize probability of >=1 allotment.
+
+    Each eligible account receives at most one minimum-size application.
+    This matches the objective of maximizing independent allotment tickets,
+    rather than maximizing the amount bid in a single account.
+    """
+    capital = max(0.0, float(capital))
+    accounts = max(0, int(accounts))
+    best = None
+
+    # Exact enumeration is tiny for the normal use case (1-10 accounts).
+    def walk(i, remaining_accounts, remaining_capital, counts):
+        nonlocal best
+        if i == len(plans):
+            used_accounts = sum(counts.values())
+            used_capital = sum(
+                counts[p.key] * p.min_amount for p in plans
+            )
+            if used_accounts == 0:
+                chance = 0.0
+            else:
+                miss = 1.0
+                for p in plans:
+                    miss *= (1.0 - p.probability) ** counts[p.key]
+                chance = 1.0 - miss
+
+            # Prefer higher chance, then lower capital, then more used accounts.
+            score = (chance, -used_capital, used_accounts)
+            if best is None or score > best["score"]:
+                best = {
+                    "score": score,
+                    "chance": chance,
+                    "used_capital": used_capital,
+                    "unused_capital": capital - used_capital,
+                    "used_accounts": used_accounts,
+                    "counts": dict(counts),
+                }
+            return
+
+        p = plans[i]
+        max_by_accounts = remaining_accounts
+        max_by_capital = int(remaining_capital // p.min_amount) if p.min_amount else 0
+        max_n = min(max_by_accounts, max_by_capital)
+        for n in range(max_n + 1):
+            counts[p.key] = n
+            walk(
+                i + 1,
+                remaining_accounts - n,
+                remaining_capital - n * p.min_amount,
+                counts,
+            )
+        counts.pop(p.key, None)
+
+    walk(0, accounts, capital, {})
+    return best
+
+
+def _application_subscription(row, category):
+    """Read IPO Ji application-wise subscription from the stored raw text."""
+    raw = row.get("raw_json")
+    if not raw or is_missing(raw):
+        return None
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        text = str(payload.get("subscription_text", ""))
+    except Exception:
+        return None
+    if not text:
+        return None
+
+    aliases = {
+        "retail": r"Retail",
+        "snii": r"(?:SNIIs?|sHNI|sNII)(?:\s*\([^)]*\))?",
+        "bnii": r"(?:BNIIs?|bHNI|bNII)(?:\s*\([^)]*\))?",
+    }
+    label = aliases.get(category)
+    if not label:
+        return None
+
+    # IPO Ji exposes two share-wise/application-wise tables. The final match
+    # for each category is the application-wise figure.
+    pattern = rf"{label}\s+(?:[\d,]+|-)\s+(?:[\d,]+|-)\s+([\d.]+)"
+    matches = re.findall(pattern, text, re.I)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def _enrich_allotment_row(row):
+    row = dict(row)
+    for category in ("retail", "snii", "bnii"):
+        row[f"{category}_app_subscription"] = _application_subscription(row, category)
+    return row
+
+app.py
+import streamlit as st
+import pandas as pd
+from pathlib import Path
+
+from config import DB_PATH
+from collector import collect_once
+from database import Database, get_df
+from styles import inject_styles
+from formatters import format_date, normalized_status
+
+st.set_page_config(
+    page_title="IPO Intelligence",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+
+# --- Authentication ---
+try:
+    import streamlit_authenticator as stauth
+    if "credentials" in st.secrets:
+        authenticator = stauth.Authenticate(
+            dict(st.secrets["credentials"]),
+            st.secrets["cookie"]["name"],
+            st.secrets["cookie"]["key"],
+            st.secrets["cookie"]["expiry_days"],
+            dict(st.secrets["preauthorized"])
+        )
+        # Using the standard login widget
+        authenticator.login()
+        if st.session_state["authentication_status"] is False:
+            st.error("Username/password is incorrect")
+            st.stop()
+        elif st.session_state["authentication_status"] is None:
+            st.warning("Please enter your username and password")
+            st.stop()
+            
+        with st.sidebar:
+            authenticator.logout("Logout", "main")
+            st.markdown(f"Welcome *{st.session_state['name']}*")
+except ImportError:
+    st.warning("streamlit-authenticator not installed. Running without auth.")
+
+inject_styles()
+
+if "ai_scores" not in st.session_state:
+    st.session_state["ai_scores"] = {}
+if "ai_chat_messages" not in st.session_state:
+    st.session_state["ai_chat_messages"] = []
+
+if not Path(DB_PATH).exists():
+    with st.sidebar:
+        st.markdown("# IPO Intelligence")
+        st.caption("Research, demand, and AI decision support")
+        st.markdown("---")
+        if st.button("Refresh data", use_container_width=True):
+            try:
+                with st.spinner("Refreshing IPO data..."):
+                    result = collect_once(enrich=True)
+                st.success(f"Updated {result['count']} IPOs.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Collector error: {exc}")
+        st.caption("Data is refreshed from the configured IPO sources.")
+    st.title("IPO Intelligence")
+    st.info("No IPO data yet. Use Refresh data in the sidebar.")
+    st.stop()
+
+try:
+    df = get_df()
+except Exception as exc:
+    st.error(f"Database error: {exc}")
+    st.stop()
+
+if df.empty:
+    with st.sidebar:
+        st.markdown("# IPO Intelligence")
+        st.caption("Research, demand, and AI decision support")
+        st.markdown("---")
+        if st.button("Refresh data", use_container_width=True):
+            try:
+                with st.spinner("Refreshing IPO data..."):
+                    result = collect_once(enrich=True)
+                st.success(f"Updated {result['count']} IPOs.")
+                st.rerun()
+            except Exception as exc:
+                st.warning("Upstream API is currently unreachable. Displaying cached data.")
+        st.caption("Data is refreshed from the configured IPO sources.")
+    st.title("IPO Intelligence")
+    st.info("No IPOs collected yet. Use Refresh data in the sidebar.")
+    st.stop()
+
+df["display_status"] = df.apply(normalized_status, axis=1)
+
+from pages.discovery import discovery_page
+from pages.allotment import allotment_page
+from pages.ai_analyst import ai_analyst_page
+from pages.ipo_detail import ipo_detail_page
+from pages.guide import guide_page
+
+DISCOVERY_PAGE = st.Page(
+    lambda: discovery_page(df),
+    title="Discovery",
+    icon="🔎",
+    url_path="discovery",
+    default=True,
+)
+ALLOTMENT_PAGE = st.Page(
+    lambda: allotment_page(df),
+    title="Allotment Optimizer",
+    icon="🎯",
+    url_path="allotment-chances",
+)
+AI_ANALYST_PAGE = st.Page(
+    lambda: ai_analyst_page(df),
+    title="AI Analyst",
+    icon="🤖",
+    url_path="ai-analyst",
+)
+IPO_DETAIL_PAGE = st.Page(
+    lambda: ipo_detail_page(df),
+    title="IPO Detail",
+    icon="📄",
+    url_path="ipo-detail",
+    visibility="hidden",
+)
+GUIDE_PAGE = st.Page(
+    lambda: guide_page(),
+    title="User Guide",
+    icon="📖",
+    url_path="guide",
+)
+
+pages = [
+    DISCOVERY_PAGE,
+    ALLOTMENT_PAGE,
+    AI_ANALYST_PAGE,
+    IPO_DETAIL_PAGE,
+    GUIDE_PAGE,
+]
+
+pg = st.navigation(pages, position="hidden")
+
+with st.sidebar:
+    st.markdown("# IPO Intelligence")
+    st.caption("Research, demand, and AI decision support")
+    st.markdown("### Navigation")
+    st.page_link(DISCOVERY_PAGE, label="Discovery", icon="🔎")
+    st.page_link(ALLOTMENT_PAGE, label="Allotment Optimizer", icon="🎯")
+    st.page_link(AI_ANALYST_PAGE, label="AI Analyst", icon="🤖")
+    st.page_link(GUIDE_PAGE, label="User Guide", icon="📖")
+    st.markdown("---")
+    if st.button("Refresh data", use_container_width=True):
+        try:
+            with st.spinner("Refreshing IPO data..."):
+                result = collect_once(enrich=True)
+            st.success(f"Updated {result['count']} IPOs.")
+            st.rerun()
+        except Exception as exc:
+            st.warning("Upstream API is currently unreachable. Displaying cached data.")
+    try:
+        latest = df["collected_at"].dropna().max()
+        if pd.notna(latest):
+            st.caption(f"Last refresh: {format_date(latest, with_time=True)}")
+        else:
+            st.caption("Data is refreshed from the configured IPO sources.")
+    except Exception:
+        st.caption("Data is refreshed from the configured IPO sources.")
+
+pg.run()
+
+collector.py
+import re
+import time
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+from config import IPOJI_BASE_URL, IPOJI_CURRENT_IPO_URL, REQUEST_TIMEOUT, DETAIL_LIMIT
+from database import Database
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+MONTHS = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+
+
+class IPOJiClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+
+    def get(self, url):
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                return response
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+
+    def get_current_ipos(self):
+        url = urljoin(IPOJI_BASE_URL, IPOJI_CURRENT_IPO_URL)
+        response = self.get(url)
+        soup = BeautifulSoup(response.text, "lxml")
+        return self._parse_current(soup, response.url)
+
+    def _parse_current(self, soup, page_url):
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        seen = set()
+
+        for heading in soup.find_all(["h2", "h3"]):
+            company = heading.get_text(" ", strip=True)
+            if not company:
+                continue
+
+            card = self._find_card(heading)
+            if card is None:
+                continue
+
+            text = card.get_text(" ", strip=True)
+            if "Offer Price" not in text:
+                continue
+
+            detail_url = self._find_detail_url(card, page_url)
+            if not detail_url:
+                continue
+
+            source_id = detail_url.rstrip("/").split("/")[-1]
+            if source_id in seen:
+                continue
+
+            row = self._parse_card(text, detail_url, company, now)
+            if row:
+                seen.add(source_id)
+                rows.append(row)
+
+        return rows
+
+    @staticmethod
+    def _find_card(heading):
+        current = heading
+        for _ in range(8):
+            current = current.parent
+            if current is None:
+                return None
+            text = current.get_text(" ", strip=True)
+            headings = current.find_all(["h2", "h3"])
+            if "Offer Price" in text and "Lot Size" in text and len(headings) == 1:
+                return current
+        return None
+
+    @staticmethod
+    def _find_detail_url(card, page_url):
+        for link in card.find_all("a", href=True):
+            url = urljoin(page_url, link["href"])
+            if "/ipo/" in url and "check" not in url.lower():
+                return url
+        return None
+
+    def _parse_card(self, text, url, company, collected_at):
+        dates = re.search(
+            rf"((?:{MONTHS})\s+\d{{1,2}},\s+\d{{4}})\s*[–-]\s*((?:{MONTHS})\s+\d{{1,2}},\s+\d{{4}})",
+            text,
+            re.I,
+        )
+        price = re.search(
+            r"Offer Price\s+₹\s*([\d,]+(?:\.\d+)?)(?:\s*-\s*([\d,]+(?:\.\d+)?))?",
+            text,
+            re.I,
+        )
+        lot = re.search(r"Lot Size\s+([\d,]+)", text, re.I)
+        issue = re.search(r"Issue Size\s+₹\s*([\d,.]+)\s*Cr", text, re.I)
+        subscription = re.search(r"Subscription\s+([\d,.]+)x", text, re.I)
+        segment = re.search(r"(Mainboard|BSE SME|NSE SME|SME)", text, re.I)
+        status = re.search(
+            r"(Live|Pre-Apply|Open|Closed|Allotment Out|Allotment Awaited|Tentative Dates|DRHP Approved)",
+            text,
+            re.I,
+        )
+
+        if not any([price, lot, issue, dates]):
+            return None
+
+        slug = url.rstrip("/").split("/")[-1]
+        subscription_url = urljoin(IPOJI_BASE_URL, f"/ipo-subscription/{slug}")
+        gmp_url = urljoin(IPOJI_BASE_URL, f"/ipo-gmp/{slug}")
+
+        return {
+            "source": "ipoji",
+            "source_id": slug,
+            "company_name": company,
+            "symbol": None,
+            "ipo_type": "IPO",
+            "segment": segment.group(1) if segment else None,
+            "status": status.group(1) if status else None,
+            "open_date": dates.group(1) if dates else None,
+            "close_date": dates.group(2) if dates else None,
+            "listing_date": None,
+            "price_low": num(price.group(1)) if price else None,
+            "price_high": num(price.group(2) or price.group(1)) if price else None,
+            "lot_size": num(lot.group(1)) if lot else None,
+            "issue_size": num(issue.group(1)) if issue else None,
+            "gmp": None,
+            "subscription": num(subscription.group(1)) if subscription else None,
+            "source_url": url,
+            "detail_url": url,
+            "subscription_url": subscription_url,
+            "gmp_url": gmp_url,
+            "collected_at": collected_at,
+            "raw": {"current_text": text},
+        }
+
+    def enrich(self, row):
+        detail = self.parse_detail(row["detail_url"])
+        subscription = self.parse_subscription(row["subscription_url"])
+        gmp = self.parse_gmp(row["gmp_url"], row.get("price_high"))
+
+        row.update(detail)
+        row.update(subscription)
+        row.update(gmp)
+        return row
+
+    def parse_detail(self, url):
+        try:
+            response = self.get(url)
+            soup = BeautifulSoup(response.text, "lxml")
+            text = soup.get_text(" ", strip=True)
+
+            listing_date = first_date_after(text, ["listing date", "listing"])
+            allotment_date = first_date_after(text, ["allotment"])
+
+            listing_exchange = extract_value(text, ["Listing At", "Listing"])
+            registrar = extract_value(text, ["registrar"])
+            lead_managers = extract_value(text, ["lead manager", "book-running lead manager"])
+
+            fresh_issue = extract_crore(text, ["fresh issue"])
+            ofs_issue = extract_crore(text, ["OFS", "offer for sale"])
+
+            # Structured valuation / quality fields from IPO Ji's detail page.
+            pre_hold = extract_percent_after(text, "Pre-Issue Holding")
+            post_hold = extract_percent_after(text, "Post-Issue Holding")
+            pe_pre = extract_number_after(text, "P/E Pre IPO")
+            pe_post = extract_number_after(text, "P/E Post IPO")
+            roe = extract_number_after(text, "ROE")
+            roce = extract_number_after(text, "ROCE")
+            ronw = extract_number_after(text, "RoNW")
+            pat_margin = extract_number_after(text, "PAT Margin")
+            debt_equity = extract_number_after(text, "Debt / Equity")
+            price_book = extract_number_after(text, "Price / Book")
+            market_cap = extract_crore(text, ["Market Cap"])
+
+            strengths = extract_bullets_section(text, "Strengths", ["Risks", "Contact Details", "Frequently Asked Questions"])
+            risks = extract_bullets_section(text, "Risks", ["Contact Details", "Frequently Asked Questions"])
+
+            anchor = parse_anchor_section(text)
+
+            return {
+                "listing_date": listing_date,
+                "allotment_date": allotment_date,
+                "listing_exchange": listing_exchange,
+                "registrar": registrar,
+                "lead_managers": lead_managers,
+                "fresh_issue": fresh_issue,
+                "ofs_issue": ofs_issue,
+                "anchor_amount": anchor.get("amount"),
+                "anchor_count": anchor.get("count"),
+                "anchor_price": anchor.get("price"),
+                "anchor_mf_pct": anchor.get("mf_pct"),
+                "anchor_summary": anchor.get("summary"),
+                "anchor_investors": anchor.get("investors"),
+                "pre_issue_holding": pre_hold,
+                "post_issue_holding": post_hold,
+                "pe_pre": pe_pre,
+                "pe_post": pe_post,
+                "roe": roe,
+                "roce": roce,
+                "ronw": ronw,
+                "pat_margin": pat_margin,
+                "debt_equity": debt_equity,
+                "price_book": price_book,
+                "market_cap": market_cap,
+                "strengths": strengths,
+                "risks": risks,
+                "raw": {"detail_text": text[:16000], "anchor_section": anchor.get("raw")}
+            }
+        except Exception as exc:
+            logging.error(f"Error parsing detail for {url}: {exc}", exc_info=True)
+            return {"raw": {"detail_error": str(exc)}}
+
+    def parse_subscription(self, url):
+        try:
+            response = self.get(url)
+            soup = BeautifulSoup(response.text, "lxml")
+            text = soup.get_text(" ", strip=True)
+
+            values = {}
+            for table in soup.find_all("table"):
+                headers = [clean(x.get_text(" ", strip=True)) for x in table.find_all("th")]
+                for tr in table.find_all("tr"):
+                    cells = [clean(x.get_text(" ", strip=True)) for x in tr.find_all(["td", "th"])]
+                    if len(cells) < 2:
+                        continue
+                    label = cells[0].lower()
+                    nums = [parse_x(x) for x in cells[1:]]
+                    nums = [x for x in nums if x is not None]
+                    if not nums:
+                        continue
+                    value = nums[-1]
+                    if "qib" in label and "qibs" in label:
+                        values["qib"] = value
+                    elif label.startswith("qib"):
+                        values["qib"] = value
+                    elif "bnii" in label or "bniis" in label:
+                        values["bnii"] = value
+                    elif "snii" in label or "sniis" in label:
+                        values["snii"] = value
+                    elif "nii" in label or "niis" in label:
+                        values["nii"] = value
+                    elif "retail" in label or "individual" in label:
+                        values["retail"] = value
+                    elif "employee" in label:
+                        values["employee"] = value
+                    elif "other" in label:
+                        values["others"] = value
+                    elif label.startswith("total"):
+                        values["total"] = value
+
+            # Fallback: the subscription summary page usually exposes the same
+            # values in cards/text even when table markup changes.
+            for label, key in [
+                ("QIB (x)", "qib"),
+                ("NII (x)", "nii"),
+                ("Retail (x)", "retail"),
+                ("Total (x)", "total"),
+            ]:
+                if key not in values:
+                    m = re.search(re.escape(label) + r"\s+([\d,.]+)", text, re.I)
+                    if m:
+                        values[key] = num(m.group(1))
+
+            apps = re.search(r"Applications\s+([\d,]+)", text, re.I)
+            values["applications"] = int(apps.group(1).replace(",", "")) if apps else None
+            values["subscription_updated_at"] = datetime.now(timezone.utc).isoformat()
+            values["raw"] = {"subscription_text": text[:12000]}
+            return values
+        except Exception as exc:
+            logging.error(f"Error parsing subscription for {url}: {exc}", exc_info=True)
+            return {"raw": {"subscription_error": str(exc)}}
+
+    def parse_gmp(self, url, price_high):
+        try:
+            response = self.get(url)
+            soup = BeautifulSoup(response.text, "lxml")
+            text = soup.get_text(" ", strip=True)
+
+            gmp_match = re.search(r"latest available GMP is ₹\s*([+-]?[\d,.]+)", text, re.I)
+            if not gmp_match:
+                gmp_match = re.search(r"GMP\s+([+-]?[\d,.]+)", text, re.I)
+            gmp = num(gmp_match.group(1)) if gmp_match else None
+
+            pct_match = re.search(r"GMP %\s*([+-]?[\d,.]+)%", text, re.I)
+            gmp_pct = num(pct_match.group(1)) if pct_match else None
+
+            listing_match = re.search(r"indicative listing\s+₹\s*([\d,.]+)", text, re.I)
+            indicative = num(listing_match.group(1)) if listing_match else None
+            if indicative is None and gmp is not None and price_high is not None:
+                indicative = price_high + gmp
+
+            updated_match = re.search(r"last recorded on\s+([^\.]+)", text, re.I)
+            updated = updated_match.group(1).strip() if updated_match else None
+
+            return {
+                "gmp": gmp,
+                "gmp_pct": gmp_pct,
+                "indicative_listing": indicative,
+                "gmp_updated_at": updated,
+                "raw": {"gmp_text": text[:12000]},
+            }
+        except Exception as exc:
+            logging.error(f"Error parsing gmp for {url}: {exc}", exc_info=True)
+            return {"raw": {"gmp_error": str(exc)}}
+
+
+def extract_value(text, labels):
+    for label in labels:
+        m = re.search(re.escape(label) + r"\s+(.{1,180}?)(?=\s+(?:The|Retail|S-HNI|B-HNI|Face Value|Lot Size|Listing At|Registrar|The total issue)\b|$)", text, re.I)
+        if m:
+            return m.group(1).strip(" .")
+    return None
+
+
+def first_date_after(text, labels):
+    date_pattern = rf"({MONTHS}\s+\d{{1,2}},\s+\d{{4}}|\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}})"
+    for label in labels:
+        m = re.search(re.escape(label) + r".{0,120}?" + date_pattern, text, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_crore(text, labels):
+    for label in labels:
+        m = re.search(re.escape(label) + r"[^.]{0,100}?₹?\s*([\d,.]+)\s*crore", text, re.I)
+        if m:
+            return num(m.group(1))
+    return None
+
+
+def extract_number_after(text, label):
+    m = re.search(
+        re.escape(label) + r"\s*(?:\([^)]*\))?\s*([+-]?[\d,]+(?:\.\d+)?)",
+        text,
+        re.I,
+    )
+    return num(m.group(1)) if m else None
+
+
+def extract_percent_after(text, label):
+    m = re.search(
+        re.escape(label) + r"\s*([+-]?[\d,]+(?:\.\d+)?)\s*%",
+        text,
+        re.I,
+    )
+    return num(m.group(1)) if m else None
+
+
+def extract_bullets_section(text, heading, stop_headings):
+    pattern = re.escape(heading) + r"\s*(.*?)(?=" + "|".join(re.escape(x) for x in stop_headings) + r"|$)"
+    m = re.search(pattern, text, re.I)
+    if not m:
+        return None
+    section = clean(m.group(1))
+    # IPO Ji renders strengths/risks as labelled sentences. Keep a bounded
+    # text field rather than trying to guess the site's HTML structure.
+    return section[:3000] if section else None
+
+
+def parse_anchor_section(text):
+    """Extract IPO Ji's anchor-book disclosure from the IPO detail page.
+
+    The exact prose varies by issue, so we retain both structured facts and
+    the original bounded section text. The AI can then distinguish facts from
+    interpretation and, when enabled, verify investor reputation via web search.
+    """
+    m = re.search(
+        r"(?:IPO\s*-\s*)?Anchor Investors\s+(.*?)(?=\s+(?:Peers Comparison|Strengths and Risks|Frequently Asked Questions|Contact Details)\b|$)",
+        text,
+        re.I,
+    )
+    section = clean(m.group(1)) if m else None
+    if not section:
+        return {"summary": None, "investors": None, "raw": None}
+
+    amount = None
+    count = None
+    price = None
+    mf_pct = None
+
+    mm = re.search(r"raising\s+₹\s*([\d,.]+)\s*crore", section, re.I)
+    if mm:
+        amount = num(mm.group(1))
+    cm = re.search(r"from\s+([\d,]+)\s+institutional investors", section, re.I)
+    if cm:
+        try:
+            count = int(cm.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    pm = re.search(r"(?:anchor|allocation) price of\s+₹\s*([\d,.]+)", section, re.I)
+    if pm:
+        price = num(pm.group(1))
+    fm = re.search(r"domestic mutual funds (?:received|receiving)\s+([\d,.]+)%", section, re.I)
+    if fm:
+        mf_pct = num(fm.group(1))
+
+    # Extract names from common IPO Ji prose patterns, while keeping the raw
+    # disclosure as the authoritative text for the model.
+    investor_chunks = []
+    for marker in ["including", "include", "participants include", "participated"]:
+        for match in re.finditer(r"\b" + re.escape(marker) + r"\s+(.{30,900})", section, re.I):
+            investor_chunks.append(match.group(1))
+    investors = " | ".join(dict.fromkeys(investor_chunks))[:4000] if investor_chunks else section[:4000]
+
+    return {
+        "amount": amount,
+        "count": count,
+        "price": price,
+        "mf_pct": mf_pct,
+        "summary": section[:4000],
+        "investors": investors,
+        "raw": section[:6000],
+    }
+
+
+def parse_x(value):
+    m = re.search(r"([\d,.]+)\s*x?", value, re.I)
+    return num(m.group(1)) if m else None
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def num(value):
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
+    try:
+        return float(cleaned) if "." in cleaned else int(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_once(enrich=True):
+    client = IPOJiClient()
+    rows = client.get_current_ipos()
+
+    if enrich:
+        db = Database()
+        try:
+            signals_map = {}
+            for row in rows:
+                sid = row.get("source_id")
+                sig = db.get_signal(sid) if sid else None
+                signals_map[sid] = sig
+        finally:
+            db.close()
+
+        def status_priority(row):
+            status = str(row.get("status") or "").lower()
+            if status in {"live", "open", "pre-apply"}:
+                base = 0
+            elif status in {"tentative dates", "drhp approved"}:
+                base = 1000
+            else:
+                base = 2000
+                
+            sid = row.get("source_id")
+            sig = signals_map.get(sid)
+            bonus = 0
+            if sig:
+                # Higher scores mean higher priority, so subtract them from base (lower is better rank)
+                bonus = (sig.get("investment_score") or 0) + (sig.get("allotment_score") or 0)
+            
+            return base - bonus
+            
+        rows.sort(key=status_priority)
+        
+        enriched = []
+        for i, row in enumerate(rows[:DETAIL_LIMIT]):
+            enriched.append(client.enrich(row))
+            
+        rows = enriched + rows[DETAIL_LIMIT:]
+
+    db = Database()
+    try:
+        count = db.upsert_ipos(rows)
+        captured = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            if row.get("subscription") is not None or row.get("qib") is not None:
+                db.add_subscription_snapshot("ipoji", row["source_id"], {
+                    "qib": row.get("qib"), "nii": row.get("nii"), "snii": row.get("snii"),
+                    "bnii": row.get("bnii"), "retail": row.get("retail"),
+                    "employee": row.get("employee"), "others": row.get("others"),
+                    "total": row.get("subscription"), "applications": row.get("applications"),
+                    "raw": row.get("raw", {})
+                }, captured)
+            if row.get("gmp") is not None:
+                db.add_gmp_snapshot("ipoji", row["source_id"], {
+                    "gmp": row.get("gmp"), "gmp_pct": row.get("gmp_pct"),
+                    "indicative_listing": row.get("indicative_listing"), "raw": row.get("raw", {})
+                }, captured)
+            
+            # Compute and store signals
+            import signal_engine
+            sub_history = db.get_subscription_history(row["source_id"])
+            gmp_history = db.get_gmp_history(row["source_id"])
+            
+            signals = signal_engine.compute_signals(
+                row, 
+                [dict(x) for x in sub_history], 
+                [dict(x) for x in gmp_history]
+            )
+            db.upsert_signal(row["source_id"], signals)
+    finally:
+        db.close()
+
+    return {"count": count, "rows": rows}
+
+
+if __name__ == "__main__":
+    result = collect_once(enrich=True)
+    print(f"Collected and enriched {result['count']} IPOs.")
+    for row in result["rows"]:
+        print(
+            f"- {row['company_name']} | sub={row.get('subscription')}x | "
+            f"QIB={row.get('qib')} | NII={row.get('nii')} | "
+            f"Retail={row.get('retail')} | GMP={row.get('gmp')}"
+        )
+
+config.py
+import os
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = str(BASE_DIR / "data" / "ipo.db")
+
+IPOJI_BASE_URL = os.getenv("IPOJI_BASE_URL", "https://www.ipoji.com")
+IPOJI_CURRENT_IPO_URL = os.getenv("IPOJI_CURRENT_IPO_URL", "/ipo/current-ipo")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+DETAIL_LIMIT = int(os.getenv("DETAIL_LIMIT", "30"))
+
+database.py
+import json
+import sqlite3
+from pathlib import Path
+
+from config import DB_PATH
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS ipos (
+    ipo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    company_name TEXT,
+    symbol TEXT,
+    ipo_type TEXT,
+    segment TEXT,
+    status TEXT,
+    open_date TEXT,
+    close_date TEXT,
+    allotment_date TEXT,
+    listing_date TEXT,
+    listing_exchange TEXT,
+    price_low REAL,
+    price_high REAL,
+    lot_size INTEGER,
+    issue_size REAL,
+    fresh_issue REAL,
+    ofs_issue REAL,
+    gmp REAL,
+    gmp_pct REAL,
+    indicative_listing REAL,
+    gmp_updated_at TEXT,
+    subscription REAL,
+    qib REAL,
+    nii REAL,
+    snii REAL,
+    bnii REAL,
+    retail REAL,
+    employee REAL,
+    others REAL,
+    applications INTEGER,
+    subscription_updated_at TEXT,
+    registrar TEXT,
+    lead_managers TEXT,
+    source_url TEXT,
+    detail_url TEXT,
+    subscription_url TEXT,
+    gmp_url TEXT,
+    anchor_amount REAL,
+    anchor_count INTEGER,
+    anchor_price REAL,
+    anchor_mf_pct REAL,
+    anchor_summary TEXT,
+    anchor_investors TEXT,
+    pre_issue_holding REAL,
+    post_issue_holding REAL,
+    pe_pre REAL,
+    pe_post REAL,
+    roe REAL,
+    roce REAL,
+    ronw REAL,
+    pat_margin REAL,
+    debt_equity REAL,
+    price_book REAL,
+    market_cap REAL,
+    strengths TEXT,
+    risks TEXT,
+    collected_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    raw_json TEXT,
+    UNIQUE(source, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS subscription_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ipo_source TEXT NOT NULL,
+    ipo_source_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    qib REAL,
+    nii REAL,
+    snii REAL,
+    bnii REAL,
+    retail REAL,
+    employee REAL,
+    others REAL,
+    total REAL,
+    applications INTEGER,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS gmp_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ipo_source TEXT NOT NULL,
+    ipo_source_id TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    gmp REAL,
+    gmp_pct REAL,
+    indicative_listing REAL,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ipo_signals (
+    source_id TEXT PRIMARY KEY,
+    signal_version TEXT,
+    subscription_velocity_total REAL,
+    subscription_velocity_qib REAL,
+    subscription_velocity_nii REAL,
+    subscription_velocity_retail REAL,
+    subscription_acceleration_total REAL,
+    subscription_acceleration_qib REAL,
+    subscription_acceleration_nii REAL,
+    subscription_acceleration_retail REAL,
+    gmp_momentum_24h REAL,
+    anchor_quality_score INTEGER,
+    valuation_score INTEGER,
+    financial_quality_score INTEGER,
+    listing_score INTEGER,
+    investment_score INTEGER,
+    allotment_score INTEGER,
+    allotment_retail INTEGER,
+    allotment_shni INTEGER,
+    allotment_bhni INTEGER,
+    signal_confidence TEXT,
+    qvt_scorecard TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_verdicts (
+    source_id TEXT PRIMARY KEY,
+    data_hash TEXT NOT NULL,
+    recommendation_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+MIGRATIONS = {
+    "allotment_date": "TEXT",
+    "listing_exchange": "TEXT",
+    "fresh_issue": "REAL",
+    "ofs_issue": "REAL",
+    "gmp_pct": "REAL",
+    "indicative_listing": "REAL",
+    "gmp_updated_at": "TEXT",
+    "qib": "REAL",
+    "nii": "REAL",
+    "snii": "REAL",
+    "bnii": "REAL",
+    "retail": "REAL",
+    "employee": "REAL",
+    "others": "REAL",
+    "applications": "INTEGER",
+    "subscription_updated_at": "TEXT",
+    "registrar": "TEXT",
+    "lead_managers": "TEXT",
+    "detail_url": "TEXT",
+    "subscription_url": "TEXT",
+    "gmp_url": "TEXT",
+    "anchor_amount": "REAL",
+    "anchor_count": "INTEGER",
+    "anchor_price": "REAL",
+    "anchor_mf_pct": "REAL",
+    "anchor_summary": "TEXT",
+    "anchor_investors": "TEXT",
+    "pre_issue_holding": "REAL",
+    "post_issue_holding": "REAL",
+    "pe_pre": "REAL",
+    "pe_post": "REAL",
+    "roe": "REAL",
+    "roce": "REAL",
+    "ronw": "REAL",
+    "pat_margin": "REAL",
+    "debt_equity": "REAL",
+    "price_book": "REAL",
+    "market_cap": "REAL",
+    "strengths": "TEXT",
+    "risks": "TEXT",
+}
+
+class Database:
+    def __init__(self, path=DB_PATH):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Added timeout=20.0 to allow waiting for concurrent locks
+        self.conn = sqlite3.connect(path, timeout=20.0)
+        self.conn.row_factory = sqlite3.Row
+        # Enable Write-Ahead Logging (WAL) for better concurrency
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.commit()
+
+    def _migrate(self):
+        existing = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(ipos)")
+        }
+        for name, sql_type in MIGRATIONS.items():
+            if name not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE ipos ADD COLUMN {name} {sql_type}"
+                )
+        
+        # Migrate ipo_signals table for qvt_scorecard
+        existing_signals = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(ipo_signals)")
+        }
+        if "qvt_scorecard" not in existing_signals:
+            self.conn.execute("ALTER TABLE ipo_signals ADD COLUMN qvt_scorecard TEXT")
+
+    def upsert_ipos(self, rows):
+        query = """
+        INSERT INTO ipos (
+            source, source_id, company_name, symbol, ipo_type, segment, status,
+            open_date, close_date, allotment_date, listing_date, listing_exchange,
+            price_low, price_high, lot_size, issue_size, fresh_issue, ofs_issue,
+            gmp, gmp_pct, indicative_listing, gmp_updated_at,
+            subscription, qib, nii, snii, bnii, retail, employee, others,
+            applications, subscription_updated_at, registrar, lead_managers,
+            source_url, detail_url, subscription_url, gmp_url,
+            anchor_amount, anchor_count, anchor_price, anchor_mf_pct, anchor_summary,
+            anchor_investors, pre_issue_holding, post_issue_holding, pe_pre, pe_post,
+            roe, roce, ronw, pat_margin, debt_equity, price_book, market_cap, strengths, risks,
+            collected_at, updated_at, raw_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(source, source_id) DO UPDATE SET
+            company_name=excluded.company_name,
+            symbol=excluded.symbol,
+            ipo_type=excluded.ipo_type,
+            segment=excluded.segment,
+            status=excluded.status,
+            open_date=excluded.open_date,
+            close_date=excluded.close_date,
+            allotment_date=excluded.allotment_date,
+            listing_date=excluded.listing_date,
+            listing_exchange=excluded.listing_exchange,
+            price_low=excluded.price_low,
+            price_high=excluded.price_high,
+            lot_size=excluded.lot_size,
+            issue_size=excluded.issue_size,
+            fresh_issue=excluded.fresh_issue,
+            ofs_issue=excluded.ofs_issue,
+            gmp=excluded.gmp,
+            gmp_pct=excluded.gmp_pct,
+            indicative_listing=excluded.indicative_listing,
+            gmp_updated_at=excluded.gmp_updated_at,
+            subscription=excluded.subscription,
+            qib=excluded.qib,
+            nii=excluded.nii,
+            snii=excluded.snii,
+            bnii=excluded.bnii,
+            retail=excluded.retail,
+            employee=excluded.employee,
+            others=excluded.others,
+            applications=excluded.applications,
+            subscription_updated_at=excluded.subscription_updated_at,
+            registrar=excluded.registrar,
+            lead_managers=excluded.lead_managers,
+            source_url=excluded.source_url,
+            detail_url=excluded.detail_url,
+            anchor_amount=excluded.anchor_amount,
+            anchor_count=excluded.anchor_count,
+            anchor_price=excluded.anchor_price,
+            anchor_mf_pct=excluded.anchor_mf_pct,
+            anchor_summary=excluded.anchor_summary,
+            anchor_investors=excluded.anchor_investors,
+            pre_issue_holding=excluded.pre_issue_holding,
+            post_issue_holding=excluded.post_issue_holding,
+            pe_pre=excluded.pe_pre,
+            pe_post=excluded.pe_post,
+            roe=excluded.roe,
+            roce=excluded.roce,
+            ronw=excluded.ronw,
+            pat_margin=excluded.pat_margin,
+            debt_equity=excluded.debt_equity,
+            price_book=excluded.price_book,
+            market_cap=excluded.market_cap,
+            strengths=excluded.strengths,
+            risks=excluded.risks,
+            subscription_url=excluded.subscription_url,
+            gmp_url=excluded.gmp_url,
+            updated_at=excluded.updated_at,
+            raw_json=excluded.raw_json
+        """
+
+        for r in rows:
+            values = (
+                r.get("source"), r.get("source_id"), r.get("company_name"),
+                r.get("symbol"), r.get("ipo_type"), r.get("segment"), r.get("status"),
+                r.get("open_date"), r.get("close_date"), r.get("allotment_date"),
+                r.get("listing_date"), r.get("listing_exchange"), r.get("price_low"),
+                r.get("price_high"), r.get("lot_size"), r.get("issue_size"),
+                r.get("fresh_issue"), r.get("ofs_issue"), r.get("gmp"),
+                r.get("gmp_pct"), r.get("indicative_listing"), r.get("gmp_updated_at"),
+                r.get("subscription"), r.get("qib"), r.get("nii"), r.get("snii"),
+                r.get("bnii"), r.get("retail"), r.get("employee"), r.get("others"),
+                r.get("applications"), r.get("subscription_updated_at"),
+                r.get("registrar"), r.get("lead_managers"), r.get("source_url"),
+                r.get("detail_url"), r.get("subscription_url"), r.get("gmp_url"),
+                r.get("anchor_amount"), r.get("anchor_count"), r.get("anchor_price"),
+                r.get("anchor_mf_pct"), r.get("anchor_summary"), r.get("anchor_investors"),
+                r.get("pre_issue_holding"), r.get("post_issue_holding"), r.get("pe_pre"), r.get("pe_post"),
+                r.get("roe"), r.get("roce"), r.get("ronw"), r.get("pat_margin"), r.get("debt_equity"),
+                r.get("price_book"), r.get("market_cap"), r.get("strengths"), r.get("risks"),
+                r.get("collected_at"), r.get("collected_at"),
+                json.dumps(r.get("raw", {}), default=str),
+            )
+            self.conn.execute(query, values)
+        self.conn.commit()
+        return len(rows)
+
+    def add_subscription_snapshot(self, source, source_id, data, captured_at):
+        self.conn.execute(
+            """INSERT INTO subscription_snapshots
+            (ipo_source, ipo_source_id, captured_at, qib, nii, snii, bnii,
+             retail, employee, others, total, applications, raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                source, source_id, captured_at, data.get("qib"), data.get("nii"),
+                data.get("snii"), data.get("bnii"), data.get("retail"),
+                data.get("employee"), data.get("others"), data.get("total"),
+                data.get("applications"), json.dumps(data.get("raw", {}), default=str),
+            ),
+        )
+        self.conn.commit()
+
+    def add_gmp_snapshot(self, source, source_id, data, captured_at):
+        self.conn.execute(
+            """INSERT INTO gmp_snapshots
+            (ipo_source, ipo_source_id, captured_at, gmp, gmp_pct,
+             indicative_listing, raw_json)
+            VALUES (?,?,?,?,?,?,?)""",
+            (
+                source, source_id, captured_at, data.get("gmp"),
+                data.get("gmp_pct"), data.get("indicative_listing"),
+                json.dumps(data.get("raw", {}), default=str),
+            ),
+        )
+        self.conn.commit()
+
+    def get_ipos(self):
+        return self.conn.execute(
+            "SELECT * FROM ipos ORDER BY close_date, company_name"
+        ).fetchall()
+
+    def get_ipo(self, source_id):
+        return self.conn.execute(
+            "SELECT * FROM ipos WHERE source='ipoji' AND source_id=?",
+            (source_id,),
+        ).fetchone()
+
+    def get_subscription_history(self, source_id):
+        return self.conn.execute(
+            """SELECT * FROM subscription_snapshots
+               WHERE ipo_source='ipoji' AND ipo_source_id=?
+               ORDER BY captured_at""",
+            (source_id,),
+        ).fetchall()
+
+    def get_gmp_history(self, source_id):
+        return self.conn.execute(
+            """SELECT * FROM gmp_snapshots
+               WHERE ipo_source='ipoji' AND ipo_source_id=?
+               ORDER BY captured_at""",
+            (source_id,),
+        ).fetchall()
+
+    def get_ai_verdict(self, source_id):
+        row = self.conn.execute("SELECT * FROM ai_verdicts WHERE source_id=?", (source_id,)).fetchone()
+        return dict(row) if row else None
+
+    def save_ai_verdict(self, source_id, data_hash, recommendation):
+        self.conn.execute("""
+            INSERT INTO ai_verdicts (source_id, data_hash, recommendation_json, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(source_id) DO UPDATE SET
+                data_hash=excluded.data_hash,
+                recommendation_json=excluded.recommendation_json,
+                updated_at=excluded.updated_at
+        """, (source_id, data_hash, json.dumps(recommendation)))
+        self.conn.commit()
+
+    def get_signal(self, source_id):
+        row = self.conn.execute("SELECT * FROM ipo_signals WHERE source_id=?", (source_id,)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_signal(self, source_id, data):
+        self.conn.execute("""
+            INSERT INTO ipo_signals (
+                source_id, signal_version, 
+                subscription_velocity_total, subscription_velocity_qib,
+                subscription_velocity_nii, subscription_velocity_retail,
+                subscription_acceleration_total, subscription_acceleration_qib,
+                subscription_acceleration_nii, subscription_acceleration_retail,
+                gmp_momentum_24h, anchor_quality_score, valuation_score,
+                financial_quality_score, listing_score, investment_score,
+                allotment_score, allotment_retail, allotment_shni, allotment_bhni,
+                signal_confidence, qvt_scorecard, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(source_id) DO UPDATE SET
+                signal_version=excluded.signal_version,
+                subscription_velocity_total=excluded.subscription_velocity_total,
+                subscription_velocity_qib=excluded.subscription_velocity_qib,
+                subscription_velocity_nii=excluded.subscription_velocity_nii,
+                subscription_velocity_retail=excluded.subscription_velocity_retail,
+                subscription_acceleration_total=excluded.subscription_acceleration_total,
+                subscription_acceleration_qib=excluded.subscription_acceleration_qib,
+                subscription_acceleration_nii=excluded.subscription_acceleration_nii,
+                subscription_acceleration_retail=excluded.subscription_acceleration_retail,
+                gmp_momentum_24h=excluded.gmp_momentum_24h,
+                anchor_quality_score=excluded.anchor_quality_score,
+                valuation_score=excluded.valuation_score,
+                financial_quality_score=excluded.financial_quality_score,
+                listing_score=excluded.listing_score,
+                investment_score=excluded.investment_score,
+                allotment_score=excluded.allotment_score,
+                allotment_retail=excluded.allotment_retail,
+                allotment_shni=excluded.allotment_shni,
+                allotment_bhni=excluded.allotment_bhni,
+                signal_confidence=excluded.signal_confidence,
+                qvt_scorecard=excluded.qvt_scorecard,
+                updated_at=excluded.updated_at
+        """, (
+            source_id, data.get("signal_version", "v1.1"),
+            data.get("subscription_velocity_total"), data.get("subscription_velocity_qib"),
+            data.get("subscription_velocity_nii"), data.get("subscription_velocity_retail"),
+            data.get("subscription_acceleration_total"), data.get("subscription_acceleration_qib"),
+            data.get("subscription_acceleration_nii"), data.get("subscription_acceleration_retail"),
+            data.get("gmp_momentum_24h"), data.get("anchor_quality_score"), data.get("valuation_score"),
+            data.get("financial_quality_score"), data.get("listing_score"), data.get("investment_score"),
+            data.get("allotment_score"), data.get("allotment_retail"), data.get("allotment_shni"),
+            data.get("allotment_bhni"), data.get("signal_confidence"), data.get("qvt_scorecard")
+        ))
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+def get_df():
+    import pandas as pd
+    import sqlite3
+    from config import DB_PATH
+    with sqlite3.connect(DB_PATH) as conn:
+        return pd.read_sql_query("SELECT * FROM ipos", conn)
+
+
+def get_selected_ipo(source_id):
+    db = Database()
+    try:
+        row = db.get_ipo(source_id)
+        sub_history = db.get_subscription_history(source_id)
+        gmp_history = db.get_gmp_history(source_id)
+        return dict(row) if row else None, [dict(x) for x in sub_history], [dict(x) for x in gmp_history]
+    finally:
+        db.close()
+
+requirements.txt
+streamlit>=1.45
+requests>=2.32
+beautifulsoup4>=4.12
+pandas>=2.2
+lxml>=5.3
+google-genai>=1.0.0
+pytest>=8.0.0
+streamlit-authenticator==0.4.1
+
+signal_engine.py
+import math
+import json
+import pandas as pd
+from datetime import datetime, timezone
+
+def _safe_float(val):
+    try:
+        return float(val) if val is not None else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def _calc_velocity(snapshots, column, now):
+    if len(snapshots) < 2:
+        return 0.0
+    
+    current = snapshots.iloc[-1]
+    prev = snapshots.iloc[-2]
+    
+    dt = (current["captured_at"] - prev["captured_at"]).total_seconds() / 3600.0
+    if dt <= 0:
+        return 0.0
+        
+    return (_safe_float(current.get(column)) - _safe_float(prev.get(column))) / dt
+
+def calculate_subscription_metrics(history_df):
+    metrics = {
+        "v_total": 0.0, "v_qib": 0.0, "v_nii": 0.0, "v_retail": 0.0,
+        "a_total": 0.0, "a_qib": 0.0, "a_nii": 0.0, "a_retail": 0.0
+    }
+    
+    if history_df.empty:
+        return metrics
+        
+    history_df["captured_at"] = pd.to_datetime(history_df["captured_at"])
+    history_df = history_df.sort_values("captured_at")
+    now = datetime.now(timezone.utc)
+    
+    if len(history_df) >= 2:
+        metrics["v_total"] = _calc_velocity(history_df, "total", now)
+        metrics["v_qib"] = _calc_velocity(history_df, "qib", now)
+        metrics["v_nii"] = _calc_velocity(history_df, "nii", now)
+        metrics["v_retail"] = _calc_velocity(history_df, "retail", now)
+        
+    if len(history_df) >= 3:
+        # Calculate velocity for the previous period to find acceleration
+        prev_period = history_df.iloc[:-1]
+        pv_total = _calc_velocity(prev_period, "total", now)
+        pv_qib = _calc_velocity(prev_period, "qib", now)
+        pv_nii = _calc_velocity(prev_period, "nii", now)
+        pv_retail = _calc_velocity(prev_period, "retail", now)
+        
+        metrics["a_total"] = metrics["v_total"] - pv_total
+        metrics["a_qib"] = metrics["v_qib"] - pv_qib
+        metrics["a_nii"] = metrics["v_nii"] - pv_nii
+        metrics["a_retail"] = metrics["v_retail"] - pv_retail
+        
+    return metrics
+
+def calculate_gmp_momentum(current_gmp_pct, gmp_history_df):
+    if gmp_history_df.empty or current_gmp_pct is None:
+        return None
+        
+    gmp_history_df["captured_at"] = pd.to_datetime(gmp_history_df["captured_at"])
+    gmp_history_df = gmp_history_df.sort_values("captured_at")
+    now = datetime.now(timezone.utc)
+    
+    # Find snapshot ~24h ago
+    one_day_ago = now - pd.Timedelta(hours=24)
+    past_snapshots = gmp_history_df[gmp_history_df["captured_at"] <= one_day_ago]
+    
+    if not past_snapshots.empty:
+        last_snapshot = past_snapshots.iloc[-1]
+        past_gmp_pct = _safe_float(last_snapshot.get("gmp_pct", 0.0))
+        return _safe_float(current_gmp_pct) - past_gmp_pct
+        
+    return None
+
+def calculate_anchor_quality(row):
+    # 40% MF participation
+    mf_pct = _safe_float(row.get("anchor_mf_pct"))
+    mf_score = 0
+    if mf_pct > 15: mf_score = 10
+    elif mf_pct > 10: mf_score = 8
+    elif mf_pct > 5: mf_score = 6
+    elif mf_pct > 0: mf_score = 4
+    else: mf_score = 2
+
+    # 30% investor breadth
+    count = _safe_float(row.get("anchor_count"))
+    count_score = 0
+    if count > 15: count_score = 10
+    elif count > 10: count_score = 8
+    elif count > 5: count_score = 6
+    elif count > 0: count_score = 4
+    else: count_score = 2
+    
+    # 30% anchor coverage (amount / issue_size)
+    amt = _safe_float(row.get("anchor_amount"))
+    issue = _safe_float(row.get("issue_size"))
+    coverage = (amt / issue * 100) if issue > 0 else 0
+    
+    cov_score = 0
+    if coverage > 30: cov_score = 10
+    elif coverage >= 20: cov_score = 8
+    elif coverage >= 10: cov_score = 6
+    elif coverage >= 5: cov_score = 4
+    elif coverage > 0: cov_score = 2
+    
+    return int(0.4 * mf_score + 0.3 * count_score + 0.3 * cov_score)
+
+def calculate_valuation_score(row):
+    pe_score = 0
+    pe = _safe_float(row.get("pe_post") or row.get("pe_pre"))
+    if pe > 0:
+        if pe <= 15: pe_score = 10
+        elif pe <= 20: pe_score = 9
+        elif pe <= 25: pe_score = 8
+        elif pe <= 30: pe_score = 7
+        elif pe <= 35: pe_score = 6
+        elif pe <= 40: pe_score = 4
+        elif pe <= 50: pe_score = 2
+        else: pe_score = 1
+    
+    pb_score = 0
+    pb = _safe_float(row.get("price_book"))
+    if pb > 0:
+        if pb <= 1.5: pb_score = 10
+        elif pb <= 2.5: pb_score = 8
+        elif pb <= 3.5: pb_score = 6
+        elif pb <= 5.0: pb_score = 4
+        else: pb_score = 2
+        
+    if pe > 0 and pb > 0:
+        return int(0.6 * pe_score + 0.4 * pb_score)
+    elif pe > 0:
+        return pe_score
+    elif pb > 0:
+        return pb_score
+    return 5 # Neutral fallback
+
+def calculate_financial_quality(row):
+    roe = _safe_float(row.get("roe"))
+    roce = _safe_float(row.get("roce"))
+    pat = _safe_float(row.get("pat_margin"))
+    debt = _safe_float(row.get("debt_equity"))
+    
+    # Evenly weighted 25% each
+    roe_score = 10 if roe > 20 else (8 if roe > 15 else (6 if roe > 10 else (4 if roe > 5 else 2)))
+    roce_score = 10 if roce > 20 else (8 if roce > 15 else (6 if roce > 10 else (4 if roce > 5 else 2)))
+    pat_score = 10 if pat > 15 else (8 if pat > 10 else (6 if pat > 5 else (4 if pat > 0 else 2)))
+    debt_score = 10 if debt < 0.5 else (8 if debt < 1.0 else (6 if debt < 1.5 else (4 if debt < 2.0 else 2)))
+    
+    return int(0.25 * roe_score + 0.25 * roce_score + 0.25 * pat_score + 0.25 * debt_score)
+
+def nonlinear_score(value, max_val=50):
+    """Logarithmic-like decay, reaching 100 at max_val"""
+    if value <= 0: return 0
+    if value >= max_val: return 100
+    # Map 1-50 non-linearly to 0-100
+    # math.log(x+1) based
+    normalized = math.log(value + 1) / math.log(max_val + 1)
+    return normalized * 100
+
+def get_stage_multiplier(row):
+    """Determine how far along the IPO is to scale subscription expectations."""
+    open_d = pd.to_datetime(row.get("open_date"), errors='coerce')
+    close_d = pd.to_datetime(row.get("close_date"), errors='coerce')
+    now = pd.Timestamp.now().normalize()
+    
+    if pd.isna(open_d) or pd.isna(close_d):
+        return 1.0 # Default full weight
+        
+    total_days = (close_d - open_d).days + 1
+    if total_days <= 0:
+        return 1.0
+        
+    days_elapsed = (now - open_d).days + 1
+    
+    if days_elapsed <= 0:
+        return 5.0 # Pre-open or Day 1 early
+        
+    progress = max(0.0, min(1.0, days_elapsed / total_days))
+    
+    # Continuous decay from 5.0 (start) to 1.0 (end)
+    return 1.0 + 4.0 * (1.0 - progress)
+
+def calculate_listing_score(row, metrics, momentum, anchor_score, valuation_score):
+    score = 0.0
+    
+    # 30% GMP
+    gmp_pct = _safe_float(row.get("gmp_pct"))
+    if gmp_pct > 50: score += 30
+    elif gmp_pct > 0: score += (gmp_pct / 50.0) * 30
+    
+    # 10% GMP Momentum
+    if momentum is not None:
+        if momentum > 10: score += 10
+        elif momentum > 0: score += (momentum / 10.0) * 10
+    else:
+        # Re-allocate momentum weight to base GMP if no momentum history
+        if gmp_pct > 50: score += 10
+        elif gmp_pct > 0: score += (gmp_pct / 50.0) * 10
+    
+    stage_mult = get_stage_multiplier(row)
+    
+    # 15% NII
+    nii = _safe_float(row.get("nii")) * stage_mult
+    score += (nonlinear_score(nii, 50) / 100.0) * 15
+    
+    # 15% QIB
+    qib = _safe_float(row.get("qib")) * stage_mult
+    score += (nonlinear_score(qib, 50) / 100.0) * 15
+    
+    # 10% Velocity Total
+    v_total = metrics["v_total"]
+    if v_total > 5: score += 10
+    elif v_total > 0: score += (v_total / 5.0) * 10
+    
+    # 5% Acceleration Total
+    a_total = metrics["a_total"]
+    if a_total > 1: score += 5
+    elif a_total > 0: score += (a_total / 1.0) * 5
+    
+    # 5% Anchor Quality
+    score += (anchor_score / 10.0) * 5
+    
+    # 10% Valuation
+    score += (valuation_score / 10.0) * 10
+    
+    return int(min(100, max(0, score)))
+
+def calculate_investment_score(financial_score, valuation_score, anchor_score):
+    score = (financial_score / 10.0) * 45 + (valuation_score / 10.0) * 40 + (anchor_score / 10.0) * 15
+    return int(min(100, max(0, score)))
+
+def calculate_allotment_scores(row):
+    """
+    Returns specific estimated allotment chances for Retail, sHNI, bHNI (0-100 scale proxy).
+    Uses non-linear inverse mappings based on subscription.
+    """
+    retail_sub = _safe_float(row.get("retail"))
+    snii_sub = _safe_float(row.get("snii"))
+    bnii_sub = _safe_float(row.get("bnii"))
+    
+    def inv_score(sub):
+        if sub <= 1: return 100
+        # If it's subscribed 10x, chance is roughly 10%. Score = 10.
+        # If it's subscribed 50x, chance is 2%. Score = 2.
+        return int(min(100, max(1, 100.0 / sub)))
+        
+    return {
+        "allotment_retail": inv_score(retail_sub),
+        "allotment_shni": inv_score(snii_sub),
+        "allotment_bhni": inv_score(bnii_sub)
+    }
+
+def calculate_confidence(row, sub_history, gmp_history):
+    pts = 0
+    if len(sub_history) >= 2: pts += 1
+    if len(sub_history) >= 5: pts += 1
+    if len(gmp_history) >= 2: pts += 1
+    if row.get("pe_post") or row.get("pe_pre"): pts += 1
+    if row.get("roe"): pts += 1
+    
+    if pts >= 4: return "High"
+    if pts >= 2: return "Medium"
+    return "Low"
+
+def compute_signals(row, sub_history, gmp_history):
+    """
+    Computes all signals for an IPO row and returns a dictionary.
+    """
+    sub_df = pd.DataFrame(sub_history) if sub_history else pd.DataFrame()
+    gmp_df = pd.DataFrame(gmp_history) if gmp_history else pd.DataFrame()
+    
+    metrics = calculate_subscription_metrics(sub_df)
+    momentum = calculate_gmp_momentum(row.get("gmp_pct"), gmp_df)
+    
+    anchor_score = calculate_anchor_quality(row)
+    val_score = calculate_valuation_score(row)
+    fin_score = calculate_financial_quality(row)
+    
+    listing = calculate_listing_score(row, metrics, momentum, anchor_score, val_score)
+    investment = calculate_investment_score(fin_score, val_score, anchor_score)
+    
+    allot = calculate_allotment_scores(row)
+    # Generic allotment score is average of the three
+    overall_allot = int((allot["allotment_retail"] + allot["allotment_shni"] + allot["allotment_bhni"]) / 3.0)
+    
+    confidence = calculate_confidence(row, sub_history, gmp_history)
+    
+    # QVT Alignment
+    # Quality: Maps to financial_quality_score (0-10)
+    # Valuation: Maps to valuation_score (0-10)
+    # Trend: Maps to Subscription Velocity and GMP trajectory (0-10 scale)
+    v_score = min(5.0, metrics["v_total"]) # Cap at 5 for score contribution
+    m_val = momentum if momentum is not None else 0
+    m_score = min(5.0, max(0.0, m_val / 2.0)) # 10% momentum = 5 points
+    if momentum is None:
+        trend_score = int(min(10, v_score * 2))
+    else:
+        trend_score = int(min(10, v_score + m_score))
+        
+    qvt_scorecard = {
+        "Quality": fin_score,
+        "Valuation": val_score,
+        "Trend": trend_score
+    }
+    
+    return {
+        "signal_version": "v1.1",
+        "subscription_velocity_total": metrics["v_total"],
+        "subscription_velocity_qib": metrics["v_qib"],
+        "subscription_velocity_nii": metrics["v_nii"],
+        "subscription_velocity_retail": metrics["v_retail"],
+        "subscription_acceleration_total": metrics["a_total"],
+        "subscription_acceleration_qib": metrics["a_qib"],
+        "subscription_acceleration_nii": metrics["a_nii"],
+        "subscription_acceleration_retail": metrics["a_retail"],
+        "gmp_momentum_24h": momentum,
+        "anchor_quality_score": anchor_score,
+        "valuation_score": val_score,
+        "financial_quality_score": fin_score,
+        "listing_score": listing,
+        "investment_score": investment,
+        "allotment_score": overall_allot,
+        "allotment_retail": allot["allotment_retail"],
+        "allotment_shni": allot["allotment_shni"],
+        "allotment_bhni": allot["allotment_bhni"],
+        "signal_confidence": confidence,
+        "qvt_scorecard": json.dumps(qvt_scorecard)
+    }
+
+tests/test_scraper.py
+import os
+import pytest
+from bs4 import BeautifulSoup
+from collector import IPOJiClient
+
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+def test_parse_detail_fixture():
+    # A small test using a mocked HTML fixture to ensure our regexes don't silently fail 
+    # if IPO Ji changes their markup.
+    
+    fixture_path = os.path.join(FIXTURE_DIR, "sample_detail.html")
+    if not os.path.exists(fixture_path):
+        pytest.skip("Fixture not found. Please add sample_detail.html to tests/fixtures/")
+        
+    with open(fixture_path, "r", encoding="utf-8") as f:
+        html = f.read()
+        
+    client = IPOJiClient()
+    
+    class MockResponse:
+        def __init__(self, text):
+            self.text = text
+            
+        def raise_for_status(self):
+            pass
+
+    # Mock the get call to return our fixture
+    original_get = client.get
+    client.get = lambda url: MockResponse(html)
+    
+    try:
+        result = client.parse_detail("http://mock.url")
+        
+        # Check that we extracted *something* successfully rather than returning Nones
+        assert result.get("fresh_issue") is not None, "Failed to extract fresh_issue"
+        assert result.get("listing_exchange") is not None, "Failed to extract listing_exchange"
+    finally:
+        client.get = original_get
+
+tests/fixtures/sample_detail.html
+<html>
+<body>
+    <div>Listing At BSE, NSE</div>
+    <div>The total issue consists of a fresh issue of ₹1,000 crore</div>
+</body>
+</html>
+
+
+--- END FILE: codebase.txt ---
+
 --- BEGIN FILE: requirements.txt ---
 
 streamlit>=1.45
@@ -3153,5 +5470,6 @@ pandas>=2.2
 lxml>=5.3
 google-genai>=1.0.0
 pytest>=8.0.0
+streamlit-authenticator==0.4.1
 
 --- END FILE: requirements.txt ---
